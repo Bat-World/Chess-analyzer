@@ -1,0 +1,288 @@
+/* Chess Analyzer Extension */
+
+#ca-trigger {
+  position: fixed;
+  bottom: 24px;
+  left: 24px;
+  z-index: 99999;
+  background: #1a1a2e;
+  color: #e2b96f;
+  border: 2px solid #e2b96f;
+  border-radius: 24px;
+  padding: 10px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  transition: background 0.2s, transform 0.1s;
+}
+
+#ca-trigger:hover {
+  background: #e2b96f;
+  color: #1a1a2e;
+  transform: scale(1.05);
+}
+
+#chess-analyzer-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 380px;
+  height: 100vh;
+  min-width: 280px;
+  min-height: 300px;
+  background: #1a1a2e;
+  color: #e8e8e8;
+  border-left: 2px solid #2a2a4a;
+  box-shadow: -4px 0 24px rgba(0,0,0,0.5);
+  z-index: 99998;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* CSS resize handle */
+  resize: both;
+}
+
+/* Left-edge resize grip */
+#chess-analyzer-panel .ca-resize-grip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 5px;
+  height: 100%;
+  cursor: ew-resize;
+  z-index: 10;
+}
+#chess-analyzer-panel .ca-resize-grip:hover {
+  background: rgba(226,185,111,0.3);
+}
+
+.ca-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #16213e;
+  padding: 10px 14px;
+  cursor: grab;
+  border-bottom: 1px solid #2a2a4a;
+  user-select: none;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
+.ca-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+/* Dock/undock toggle */
+.ca-dock-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #888;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  line-height: 1;
+}
+.ca-dock-btn:hover { color: #e2b96f; border-color: #e2b96f; }
+
+.ca-title {
+  font-weight: 700;
+  font-size: 14px;
+  color: #e2b96f;
+}
+
+.ca-close {
+  background: none;
+  border: none;
+  color: #666;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0;
+  line-height: 1;
+}
+.ca-close:hover { color: #fff; }
+
+.ca-body {
+  padding: 12px;
+  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ca-analyze-btn {
+  width: 100%;
+  padding: 10px;
+  background: #e2b96f;
+  color: #1a1a2e;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+.ca-analyze-btn:hover   { opacity: 0.85; }
+.ca-analyze-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.ca-status {
+  font-size: 12px;
+  color: #aaa;
+  line-height: 1.5;
+}
+
+/* ── Current move card ─────────────────────── */
+
+.ca-nav-hint {
+  font-size: 12px;
+  color: #666;
+  text-align: center;
+  padding: 12px 0;
+}
+
+.ca-current-card {
+  background: #16213e;
+  border-radius: 8px;
+  padding: 12px;
+  border-left: 4px solid #888;
+}
+
+.ca-current-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.ca-move-num  { color: #888; font-size: 11px; }
+.ca-move-san  { font-weight: 700; font-size: 15px; color: #fff; }
+
+.ca-move-badge {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  color: #fff;
+  text-transform: capitalize;
+}
+
+.ca-best-move {
+  font-size: 12px;
+  color: #8bc34a;
+  margin-bottom: 6px;
+}
+
+.ca-delta {
+  color: #f44336;
+  margin-left: 4px;
+}
+
+.ca-explanation {
+  font-size: 12px;
+  color: #ccc;
+  line-height: 1.6;
+  border-top: 1px solid #2a2a4a;
+  padding-top: 8px;
+  margin-top: 4px;
+}
+
+.ca-muted { color: #555 !important; }
+
+/* ── Live Log ──────────────────────────────── */
+
+.ca-log-section {
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.ca-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  background: #0f1525;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: #555;
+  cursor: default;
+}
+
+.ca-log-toggle {
+  background: none;
+  border: none;
+  color: #555;
+  cursor: pointer;
+  font-size: 10px;
+  padding: 0;
+}
+.ca-log-toggle:hover { color: #aaa; }
+
+.ca-log {
+  background: #0a0f1e;
+  padding: 8px;
+  max-height: 200px;
+  overflow-y: auto;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.ca-log-line       { color: #888; margin-bottom: 1px; }
+.ca-log-time       { color: #333; margin-right: 6px; user-select: none; }
+.ca-log-ok         { color: #4caf50; }
+.ca-log-error      { color: #f44336; }
+.ca-log-warn       { color: #ff9800; }
+.ca-log-engine     { color: #64b5f6; }
+.ca-log-result     { color: #aaa; padding-left: 14px; }
+.ca-log-gpt        { color: #ce93d8; }
+.ca-log-gpt-result { color: #888; padding-left: 14px; font-style: italic; }
+.ca-log-section-label { color: #e2b96f; }
+.ca-log-summary    { color: #fff; font-weight: bold; }
+.ca-log-blunder    { color: #9c27b0; font-weight: bold; }
+.ca-log-mistake    { color: #f44336; font-weight: bold; }
+.ca-log-inaccuracy { color: #ff9800; }
+.ca-log-best       { color: #4caf50; }
+.ca-log-good       { color: #8bc34a; }
+
+/* ── Summary list ──────────────────────────── */
+
+.ca-summary {
+  border-top: 1px solid #2a2a4a;
+  padding-top: 8px;
+}
+
+.ca-summary-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: #555;
+  margin-bottom: 6px;
+}
+
+.ca-summary-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.ca-summary-row:hover    { background: #1e2a4a; }
+.ca-active-row           { background: #1e2a4a; outline: 1px solid #e2b96f; }
+
+.ca-row-num   { color: #666; font-size: 11px; width: 30px; }
+.ca-row-san   { font-weight: 600; flex: 1; }
+.ca-row-badge { font-size: 13px; font-weight: 700; width: 24px; text-align: right; }
