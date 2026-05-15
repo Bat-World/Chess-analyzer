@@ -2,12 +2,10 @@
   "manifest_version": 3,
   "name": "Chess Analyzer",
   "version": "1.0.0",
-  "description": "Post-game chess analysis with Stockfish engine and AI explanations",
-  "permissions": ["storage"],
+  "description": "Post-game chess analysis with Stockfish engine",
+  "permissions": ["offscreen"],
   "host_permissions": [
-    "https://www.chess.com/*",
-    "https://api.chess.com/*",
-    "https://api.openai.com/*"
+    "https://www.chess.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -21,17 +19,16 @@
     }
   ],
   "action": {
-    "default_popup": "popup.html",
+    "default_title": "Open Chess Analyzer",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     }
   },
-  "web_accessible_resources": [
-    {
-      "resources": ["stockfish.js"],
-      "matches": ["https://www.chess.com/*"]
-    }
-  ]
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
 }

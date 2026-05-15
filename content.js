@@ -4,201 +4,266 @@
   'use strict';
 
   // ── State ──────────────────────────────────────────────────────────────────
-  let sfWorker      = null;
   let sfReady       = false;
   let analyzedMoves = [];
   let currentHalfMove = -1;
+  let currentArrowIdx = -1; // -1 = played move, 0..2 = engine top moves
 
-  // ── Stockfish (runs as Worker directly in content script) ──────────────────
+  // ── SAN / move helpers ────────────────────────────────────────────────────
+
+  // Convert a UCI move (e.g. "e2e4", "e7e8q") to SAN ("e4", "e8=Q") given the
+  // FEN of the position *before* the move. Falls back to UCI on failure.
+  function uciToSan(fen, uci) {
+    if (!uci || uci.length < 4) return uci || '';
+    try {
+      const c = new Chess(fen);
+      const from = uci.slice(0, 2);
+      const to   = uci.slice(2, 4);
+      const promotion = uci.length === 5 ? uci[4] : undefined;
+      const m = c.move({ from, to, promotion });
+      return m?.san ?? uci;
+    } catch { return uci; }
+  }
+
+  // Resolve a move (SAN or UCI) to {from, to} squares for arrow drawing.
+  function moveSquares(fen, sanOrUci) {
+    if (!sanOrUci) return null;
+    try {
+      const c = new Chess(fen);
+      // Try as UCI first
+      if (/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(sanOrUci)) {
+        const from = sanOrUci.slice(0, 2);
+        const to   = sanOrUci.slice(2, 4);
+        const promotion = sanOrUci.length === 5 ? sanOrUci[4] : undefined;
+        const m = c.move({ from, to, promotion });
+        return m ? { from: m.from, to: m.to } : null;
+      }
+      const m = c.move(sanOrUci, { sloppy: true });
+      return m ? { from: m.from, to: m.to } : null;
+    } catch { return null; }
+  }
+
+  // ── Stockfish bridge ──────────────────────────────────────────────────────
+  // The engine lives in an offscreen document at the extension origin (see
+  // background.js / offscreen.js). We talk to it by message, not by Worker.
+
+  const pendingAnalysis = new Map(); // id → resolve fn
+  let nextAnalysisId = 1;
 
   function initStockfish() {
     return new Promise((resolve, reject) => {
-      sfWorker = new Worker(chrome.runtime.getURL('stockfish.js'));
-      const timeout = setTimeout(() => reject(new Error('Stockfish init timeout')), 10000);
-
-      sfWorker.onmessage = (e) => {
-        if (e.data === 'readyok') {
-          clearTimeout(timeout);
-          sfReady = true;
-          resolve();
-        }
-      };
-      sfWorker.onerror = (e) => { clearTimeout(timeout); reject(e); };
-      sfWorker.postMessage('uci');
-      sfWorker.postMessage('isready');
+      const timeout = setTimeout(() => reject(new Error('Engine init timeout')), 15000);
+      chrome.runtime.sendMessage({ type: 'INIT_ENGINE' }, (res) => {
+        clearTimeout(timeout);
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        if (res?.ok) { sfReady = true; resolve(); }
+        else reject(new Error(res?.error || 'Engine init failed'));
+      });
     });
   }
 
   function analyzePosition(fen, depth = 14, multiPV = 3) {
-    return new Promise((resolve) => {
-      const lines = [];
-
-      sfWorker.onmessage = (e) => {
-        const line = typeof e.data === 'string' ? e.data : String(e.data);
-        lines.push(line);
-        if (line.startsWith('bestmove')) {
-          resolve(parseEngineOutput(lines, line));
-        }
-      };
-
-      sfWorker.postMessage(`setoption name MultiPV value ${multiPV}`);
-      sfWorker.postMessage('ucinewgame');
-      sfWorker.postMessage(`position fen ${fen}`);
-      sfWorker.postMessage(`go depth ${depth}`);
+    return new Promise((resolve, reject) => {
+      const id = nextAnalysisId++;
+      const timeout = setTimeout(() => {
+        pendingAnalysis.delete(id);
+        reject(new Error('Engine timeout for FEN: ' + fen));
+      }, 30000);
+      pendingAnalysis.set(id, (result) => { clearTimeout(timeout); resolve(result); });
+      chrome.runtime.sendMessage({ type: 'ANALYZE_POSITION', id, fen, depth, multiPV });
     });
-  }
-
-  function parseEngineOutput(lines, bestmoveLine) {
-    const topMoves = [];
-
-    for (const line of lines) {
-      const multipvMatch = line.match(/multipv (\d+)/);
-      const scoreMatch   = line.match(/score (cp|mate) (-?\d+)/);
-      const pvMatch      = line.match(/ pv (\S+)/);
-      const depthMatch   = line.match(/depth (\d+)/);
-      if (!multipvMatch || !scoreMatch || !pvMatch) continue;
-
-      const idx   = parseInt(multipvMatch[1]) - 1;
-      const type  = scoreMatch[1];
-      const val   = parseInt(scoreMatch[2]);
-      const depth = depthMatch ? parseInt(depthMatch[1]) : 0;
-
-      if (!topMoves[idx] || depth > (topMoves[idx]._depth ?? 0)) {
-        topMoves[idx] = {
-          uci:    pvMatch[1],
-          score:  type === 'cp' ? val / 100 : (val > 0 ? 99 : -99),
-          isMate: type === 'mate',
-          mateIn: type === 'mate' ? val : null,
-          _depth: depth,
-        };
-      }
-    }
-
-    const bm = bestmoveLine.match(/bestmove (\S+)/)?.[1] ?? null;
-    return { bestMove: bm, topMoves: topMoves.filter(Boolean) };
   }
 
   // ── PGN extraction ─────────────────────────────────────────────────────────
+  // Strategy: drive chess.com's own Share → PGN modal. It's the only source
+  // that's guaranteed correct, available, and stable across page redesigns
+  // (selectors live on data attributes and ARIA labels, not hashed classes).
+  // If automation fails, fall through to a manual paste textarea.
 
-  // Inject a <script> into the page context so we can read window.chesscom,
-  // Vue instances etc. — content scripts run in an isolated world and cannot
-  // access page-level JS variables directly.
-  function readFromPageContext() {
-    return new Promise((resolve) => {
-      const id = 'CA_PAGE_DATA_' + Date.now();
-      const handler = (e) => {
-        if (e.data?.type === id) {
-          window.removeEventListener('message', handler);
-          resolve(e.data.payload);
-        }
-      };
-      window.addEventListener('message', handler);
-
-      const script = document.createElement('script');
-      script.textContent = `(function(){
-        try {
-          // username from window or nav
-          const username =
-            window?.chesscom?.user?.username ||
-            window?.chesscom?.username ||
-            document.querySelector('.username')?.textContent?.trim() ||
-            document.querySelector('[class*="username"]')?.textContent?.trim() ||
-            null;
-
-          // PGN from Vue board instance
-          let pgn = null;
-          const board = document.querySelector('chess-board') || document.querySelector('wc-chess-board');
-          if (board) {
-            const vue = board.__vue__ || board.__vue3__ || board._vei;
-            const game = vue?.game || vue?.$parent?.game || vue?.controller?.game || vue?.chessboard?.game;
-            if (game) {
-              pgn = typeof game.pgn === 'function' ? game.pgn() : game.pgn;
-            }
-          }
-
-          window.postMessage({ type: '${id}', payload: { username, pgn } }, '*');
-        } catch(e) {
-          window.postMessage({ type: '${id}', payload: { username: null, pgn: null, err: e.message } }, '*');
-        }
-      })();`;
-      document.documentElement.appendChild(script);
-      script.remove();
-
-      // timeout fallback
-      setTimeout(() => { window.removeEventListener('message', handler); resolve({}); }, 2000);
-    });
-  }
-
-  async function getPGN() {
-    const liveMatch  = location.href.match(/chess\.com\/game\/live\/(\d+)/);
-    const dailyMatch = location.href.match(/chess\.com\/game\/daily\/(\d+)/);
-    const gameId   = liveMatch?.[1] || dailyMatch?.[1];
-    const gameType = liveMatch ? 'live' : dailyMatch ? 'daily' : null;
-
-    // Try reading username + pgn from page JS context first
-    log('Reading game data from page context...', 'info');
-    const pageData = await readFromPageContext();
-    const username = pageData.username || null;
-    log(`Page context → username: "${username || 'not found'}", pgn: ${pageData.pgn ? 'found ✓' : 'not found'}`, pageData.pgn ? 'ok' : 'warn');
-
-    if (pageData.pgn) return pageData.pgn;
-
-    if (gameId && gameType) {
-      log(`Trying chess.com public API (game ${gameId})...`, 'info');
-      if (username) {
-        const pgn = await fetchPGNFromPublicAPI(username, gameId, gameType);
-        if (pgn) { log('Loaded from public API ✓', 'ok'); return pgn; }
-      }
-
-      log('Trying internal callback API...', 'warn');
-      const pgn2 = await fetchPGNFromCallback(gameType, gameId);
-      if (pgn2) { log('Loaded from callback API ✓', 'ok'); return pgn2; }
+  function findShareButton() {
+    // Prefer exact ARIA match — chess.com's primary Share button is reliably
+    // labelled. Class-based hints are deliberately avoided here because the
+    // share-menu modal itself contains a nested element matching those classes
+    // and clicking it does nothing.
+    const candidates = [
+      ...document.querySelectorAll('button[aria-label="Share" i]'),
+      ...document.querySelectorAll('a[role="button"][aria-label="Share" i]'),
+      ...document.querySelectorAll('button[aria-label^="Share " i]'),
+    ];
+    for (const el of candidates) {
+      // Skip anything already inside an open share modal
+      if (el.closest('[class*="share-menu"], [class*="modal"]')) continue;
+      return el;
     }
-
-    log('All API methods failed — trying DOM reconstruction...', 'warn');
-    return reconstructPGNFromDOM();
-  }
-
-  async function fetchPGNFromPublicAPI(username, gameId, gameType) {
-    for (let offset = 0; offset <= 1; offset++) {
-      const d     = new Date(new Date().getFullYear(), new Date().getMonth() - offset, 1);
-      const year  = d.getFullYear();
-      const month = String(d.getMonth() + 1).padStart(2, '0');
-      try {
-        log(`  api.chess.com/pub/player/${username}/games/${year}/${month}`, 'info');
-        const res = await fetch(`https://api.chess.com/pub/player/${username}/games/${year}/${month}`);
-        if (!res.ok) { log(`  → HTTP ${res.status}`, 'warn'); continue; }
-        const data = await res.json();
-        log(`  → Got ${data.games?.length ?? 0} games`, 'info');
-        const game = data.games?.find((g) => g.url === `https://www.chess.com/game/${gameType}/${gameId}`);
-        if (game?.pgn) return game.pgn;
-        log(`  → Game ${gameId} not found in this month`, 'warn');
-      } catch (e) { log(`  → Error: ${e.message}`, 'error'); }
+    // Fallback: visible-text "Share" on a top-level button
+    for (const b of document.querySelectorAll('button')) {
+      if (b.closest('[class*="share-menu"], [class*="modal"]')) continue;
+      if ((b.textContent || '').trim().toLowerCase() === 'share') return b;
     }
     return null;
   }
 
-  async function fetchPGNFromCallback(type, gameId) {
-    try {
-      const url = `https://www.chess.com/callback/${type}/game/${gameId}`;
-      log(`  ${url}`, 'info');
-      const res = await fetch(url, { credentials: 'include' });
-      log(`  → HTTP ${res.status}`, res.ok ? 'info' : 'warn');
-      if (!res.ok) return null;
-      const data = await res.json();
-      return data?.game?.pgn || data?.pgn || null;
-    } catch (e) { log(`  → Error: ${e.message}`, 'error'); return null; }
+  function findPgnTab() {
+    const all = document.querySelectorAll('button, [role="tab"], a');
+    for (const el of all) {
+      const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+      const txt  = (el.textContent || '').trim().toLowerCase();
+      if (txt === 'pgn' || aria === 'pgn' || aria.includes('pgn tab')) return el;
+    }
+    return null;
   }
 
-  function reconstructPGNFromDOM() {
-    const container = document.querySelector('.moves-wrapper, .move-list, [class*="moves"]');
-    if (!container) { log('No move list container found in DOM', 'error'); return null; }
-    const pat = /^([KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](=[QRBN])?[+#]?|O-O-O|O-O)$/;
-    const candidates = [...container.querySelectorAll('span,div')]
-      .map((el) => el.textContent.trim()).filter((t) => pat.test(t));
-    log(`DOM reconstruction found ${candidates.length} move tokens`, candidates.length ? 'ok' : 'warn');
-    if (!candidates.length) return null;
-    return candidates.map((m, i) => (i % 2 === 0 ? `${Math.floor(i/2)+1}. ` : '') + m).join(' ');
+  function findShareModalCloseButton() {
+    const modal = document.querySelector('.share-menu-tab-pgn-textarea')?.closest('[class*="modal"]');
+    if (!modal) return null;
+    return modal.querySelector('[aria-label*="close" i], [aria-label*="Close" i], button[class*="close"]');
+  }
+
+  function waitForElement(selector, timeoutMs = 3000) {
+    return new Promise((resolve) => {
+      const found = document.querySelector(selector);
+      if (found) return resolve(found);
+      const obs = new MutationObserver(() => {
+        const el = document.querySelector(selector);
+        if (el) { obs.disconnect(); resolve(el); }
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+      setTimeout(() => { obs.disconnect(); resolve(null); }, timeoutMs);
+    });
+  }
+
+  // Once the share modal is actually in the DOM, hide *that specific element*
+  // by inline-style. Much safer than a global CSS rule that might break
+  // chess.com's other modals.
+  function hideElement(el) {
+    if (!el) return;
+    el.dataset.caHidden = el.getAttribute('style') || '';
+    el.style.cssText += ';visibility:hidden !important;opacity:0 !important;pointer-events:none !important;';
+  }
+  function unhideElement(el) {
+    if (!el) return;
+    el.setAttribute('style', el.dataset.caHidden || '');
+    delete el.dataset.caHidden;
+  }
+
+  function closeShareModal() {
+    const closeBtn = findShareModalCloseButton();
+    if (closeBtn) { closeBtn.click(); return; }
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+  }
+
+  function describeButton(el) {
+    if (!el) return '<none>';
+    const aria = el.getAttribute('aria-label') || '';
+    const txt  = (el.textContent || '').trim().slice(0, 40);
+    const cls  = (el.className || '').toString().slice(0, 60);
+    return `aria="${aria}" text="${txt}" class="${cls}"`;
+  }
+
+  async function extractPGNViaShareButton() {
+    const shareBtn = findShareButton();
+    if (!shareBtn) { log('No Share button visible on this page', 'warn'); return null; }
+    log(`Share button found → ${describeButton(shareBtn)}`, 'info');
+
+    log('Clicking Share...', 'info');
+    shareBtn.click();
+
+    // First locate the modal container (so we can hide it briefly), then look
+    // for the PGN textarea inside.
+    const modal = await waitForElement('[class*="share-menu"], [class*="modal-container"]', 3000);
+    if (modal) {
+      log('Share modal opened, hiding it during read', 'info');
+      hideElement(modal);
+    } else {
+      log('Share modal did not appear within 3s', 'warn');
+    }
+
+    let textarea = await waitForElement('.share-menu-tab-pgn-textarea', 2500);
+    if (!textarea) {
+      const pgnTab = findPgnTab();
+      if (pgnTab) {
+        log(`Clicking PGN tab → ${describeButton(pgnTab)}`, 'info');
+        pgnTab.click();
+        textarea = await waitForElement('.share-menu-tab-pgn-textarea', 3000);
+      } else {
+        log('No PGN tab found inside modal', 'warn');
+      }
+    }
+
+    let pgn = null;
+    if (textarea) {
+      pgn = textarea.value || textarea.textContent || null;
+      log(`PGN textarea found, ${pgn?.length ?? 0} chars`, 'info');
+    } else {
+      log('PGN textarea did not appear', 'warn');
+    }
+
+    closeShareModal();
+    unhideElement(modal);
+
+    return pgn && pgn.trim() ? pgn.trim() : null;
+  }
+
+  function waitForManualPaste() {
+    return new Promise((resolve) => {
+      const fb = document.getElementById('ca-paste-fallback');
+      if (!fb) { resolve(null); return; }
+      fb.style.display = 'block';
+      const ta  = document.getElementById('ca-paste-textarea');
+      const ok  = document.getElementById('ca-paste-submit');
+      const no  = document.getElementById('ca-paste-cancel');
+      ta.value = '';
+      ta.focus();
+      const cleanup = () => {
+        fb.style.display = 'none';
+        ok.removeEventListener('click', onOk);
+        no.removeEventListener('click', onNo);
+      };
+      const onOk = () => { const v = ta.value.trim(); cleanup(); resolve(v || null); };
+      const onNo = () => { cleanup(); resolve(null); };
+      ok.addEventListener('click', onOk);
+      no.addEventListener('click', onNo);
+    });
+  }
+
+  async function getPGN() {
+    log('Extracting PGN via chess.com Share menu...', 'info');
+    const pgn = await extractPGNViaShareButton();
+    if (pgn) { log('PGN captured ✓', 'ok'); return pgn; }
+
+    log('Automation failed — paste PGN manually below', 'warn');
+    const pasted = await waitForManualPaste();
+    if (pasted) log('PGN pasted ✓', 'ok');
+    return pasted;
+  }
+
+  // ── Share-button presence probe (gates Analyze button) ────────────────────
+  // Finished games on chess.com expose a Share button. Live in-progress games
+  // do not. We poll on a low-frequency interval instead of a MutationObserver
+  // because chess.com mutates the DOM heavily (clocks, animations, move list)
+  // and observing the whole subtree freezes the page.
+
+  let lastShareReady = null;
+  function updateAnalyzeButtonState() {
+    const btn = document.getElementById('ca-analyze-btn');
+    if (!btn) return;
+    const ready = !!findShareButton();
+    if (ready === lastShareReady) return;
+    lastShareReady = ready;
+    btn.disabled = !ready;
+    btn.title = ready ? '' : 'Waiting for game to end (no Share button on page yet)';
+    btn.textContent = ready ? 'Analyze Game' : 'Waiting for game to end…';
+  }
+
+  let shareProbeInterval = null;
+  function startShareProbe() {
+    lastShareReady = null;
+    updateAnalyzeButtonState();
+    stopShareProbe();
+    shareProbeInterval = setInterval(updateAnalyzeButtonState, 1500);
+  }
+  function stopShareProbe() {
+    if (shareProbeInterval) { clearInterval(shareProbeInterval); shareProbeInterval = null; }
   }
 
   // ── Move classification ────────────────────────────────────────────────────
@@ -216,20 +281,6 @@
       if (delta < threshold) return label;
     }
     return 'blunder';
-  }
-
-  // ── GPT explanation ────────────────────────────────────────────────────────
-
-  async function getExplanation(move, apiKey) {
-    const { moveNumber, color, played, bestMove, classification, scoreDelta, fen } = move;
-    const prompt = `You are a chess coach. Explain in 2-3 sentences for a beginner.
-Position (FEN): ${fen}
-Move ${moveNumber} (${color}) played: ${played} — ${classification} (${scoreDelta?.toFixed(2)} pawn drop)
-Engine best: ${bestMove}
-Why was "${played}" a ${classification}? What makes "${bestMove}" better? Be specific.`;
-
-    const res = await chrome.runtime.sendMessage({ type: 'GPT_EXPLAIN', prompt, apiKey });
-    return res?.text ?? null;
   }
 
   // ── Live log ───────────────────────────────────────────────────────────────
@@ -307,13 +358,7 @@ Why was "${played}" a ${classification}? What makes "${bestMove}" better? Be spe
       log('Stockfish already running ✓', 'ok');
     }
 
-    // 4. Get API key
-    const { openaiApiKey } = await chrome.storage.sync.get('openaiApiKey');
-    if (!openaiApiKey) {
-      log('No API key set — open extension popup to add your OpenAI key', 'warn');
-    }
-
-    // 5. Analyze each position
+    // 4. Analyze each position
     const results = [];
     for (let i = 0; i < positions.length; i++) {
       const { fen, san, moveNumber, color } = positions[i];
@@ -341,43 +386,31 @@ Why was "${played}" a ${classification}? What makes "${bestMove}" better? Be spe
       results.push({ index: i, moveNumber, color, played: san, fen, engineData, bestMove, scoreDelta: delta, classification });
     }
 
-    // 6. GPT explanations for blunders/mistakes/inaccuracies
     analyzedMoves = results;
-    if (openaiApiKey) {
-      const needGPT = results.filter((m) => ['blunder', 'mistake', 'inaccuracy'].includes(m.classification));
-      log(`─── Stockfish done. Requesting GPT explanations for ${needGPT.length} moves... ───`, 'section');
 
-      for (const move of needGPT) {
-        log(`[GPT] Explaining move ${move.moveNumber}. ${move.color}: ${move.played} (${move.classification})...`, 'gpt');
-        const explanation = await getExplanation(move, openaiApiKey);
-        move.explanation = explanation;
-        if (explanation) {
-          log(`→ "${explanation.slice(0, 80)}${explanation.length > 80 ? '…' : ''}"`, 'gpt-result');
-        } else {
-          log('→ No explanation returned', 'warn');
-        }
-      }
-    } else {
-      log('Skipping GPT (no API key)', 'warn');
-    }
-
-    // 7. Summary stats
+    // 5. Summary stats
     const counts = { blunder: 0, mistake: 0, inaccuracy: 0, good: 0, best: 0 };
     for (const m of analyzedMoves) counts[m.classification] = (counts[m.classification] ?? 0) + 1;
     log(`─── Analysis complete ───`, 'section');
-    log(`?? ${counts.blunder} blunders  ? ${counts.mistake} mistakes  ?! ${counts.inaccuracy} inaccuracies  ✓ ${counts.best + counts.good} good/best`, 'summary');
+    log(`${counts.blunder} blunders · ${counts.mistake} mistakes · ${counts.inaccuracy} inaccuracies · ${counts.best + counts.good} good/best`, 'summary');
 
-    statusEl.innerHTML = `
-      <span style="color:#9c27b0">?? ${counts.blunder}</span>
-      <span style="color:#f44336">? ${counts.mistake}</span>
-      <span style="color:#ff9800">?! ${counts.inaccuracy}</span>
-      <span style="color:#8bc34a">✓ ${counts.best + counts.good}</span>
-    `;
+    statusEl.innerHTML = renderStatsHtml(counts);
 
     currentHalfMove = getCurrentHalfMoveFromURL();
+    currentArrowIdx = -1;
     renderCurrentMove();
     renderSummaryList();
     btn.disabled = false;
+  }
+
+  function renderStatsHtml(counts) {
+    const order = ['blunder', 'mistake', 'inaccuracy', 'good', 'best'];
+    return `<div class="ca-stats">` + order.map((k) => `
+      <div class="ca-stat ca-stat-${k}" title="${CLASS_LABELS[k]}">
+        <span class="ca-stat-dot"></span>
+        <span class="ca-stat-count">${counts[k] ?? 0}</span>
+        <span class="ca-stat-label">${CLASS_LABELS[k]}</span>
+      </div>`).join('') + `</div>`;
   }
 
   // ── Move navigation ────────────────────────────────────────────────────────
@@ -404,55 +437,182 @@ Why was "${played}" a ${classification}? What makes "${bestMove}" better? Be spe
   // ── Render ─────────────────────────────────────────────────────────────────
 
   const CLASS_COLORS = { best: '#4caf50', good: '#8bc34a', inaccuracy: '#ff9800', mistake: '#f44336', blunder: '#9c27b0', unknown: '#888' };
-  const CLASS_ICONS  = { best: '✓', good: '○', inaccuracy: '?!', mistake: '?', blunder: '??', unknown: '—' };
+  const CLASS_LABELS = { best: 'Best', good: 'Good', inaccuracy: 'Inaccuracy', mistake: 'Mistake', blunder: 'Blunder' };
+  // Always use filled glyphs; color white vs. black via CSS.
+  const PIECE_GLYPH  = { p: '♟', n: '♞', b: '♝', r: '♜', q: '♛', k: '♚',
+                         P: '♟', N: '♞', B: '♝', R: '♜', Q: '♛', K: '♚' };
+
+  function fmtScore(m) {
+    if (!m) return '';
+    if (m.isMate) return `M${Math.abs(m.mateIn)}${m.mateIn < 0 ? '−' : ''}`;
+    return (m.score > 0 ? '+' : '') + m.score.toFixed(2);
+  }
+
+  function renderMiniBoard(fen, arrow) {
+    let board;
+    try { board = new Chess(fen).board(); } catch { return ''; }
+    const SQ = 28;
+    const size = SQ * 8;
+    let cells = '';
+    for (let r = 0; r < 8; r++) {
+      for (let f = 0; f < 8; f++) {
+        const piece = board[r][f];
+        const cls = ((r + f) % 2 === 0) ? 'l' : 'd';
+        const glyph = piece ? PIECE_GLYPH[piece.color === 'w' ? piece.type.toUpperCase() : piece.type] : '';
+        const colorCls = piece ? (piece.color === 'w' ? 'pw' : 'pb') : '';
+        cells += `<div class="ca-mb-sq ${cls} ${colorCls}">${glyph}</div>`;
+      }
+    }
+    let arrowSvg = '';
+    if (arrow?.from && arrow?.to) {
+      const toXY = (sq) => ({
+        x: (sq.charCodeAt(0) - 97) * SQ + SQ / 2,
+        y: (8 - parseInt(sq[1])) * SQ + SQ / 2,
+      });
+      const a = toXY(arrow.from), b = toXY(arrow.to);
+      const color = arrow.color || '#4caf50';
+      const mid = Math.random().toString(36).slice(2, 8);
+      arrowSvg = `
+        <svg class="ca-mb-arrows" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+          <defs>
+            <marker id="ah-${mid}" viewBox="0 0 10 10" refX="7" refY="5"
+                    markerWidth="4.5" markerHeight="4.5" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="${color}" />
+            </marker>
+          </defs>
+          <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"
+                stroke="${color}" stroke-width="3.5" stroke-linecap="round"
+                marker-end="url(#ah-${mid})" opacity="0.88" />
+        </svg>`;
+    }
+    return `<div class="ca-mb" style="width:${size}px;height:${size}px">
+      <div class="ca-mb-board" style="grid-template-columns:repeat(8,${SQ}px);grid-template-rows:repeat(8,${SQ}px)">${cells}</div>
+      ${arrowSvg}
+    </div>`;
+  }
 
   function renderCurrentMove() {
     const el = document.getElementById('ca-view');
     if (!el) return;
     const move = analyzedMoves[currentHalfMove];
-    if (!move) { el.innerHTML = `<div class="ca-nav-hint">Navigate with ← → to see move analysis</div>`; return; }
+    if (!move) {
+      el.innerHTML = `<div class="ca-nav-hint">Navigate with ← → to see move analysis</div>`;
+      return;
+    }
 
-    const color = CLASS_COLORS[move.classification] ?? '#888';
-    const icon  = CLASS_ICONS[move.classification]  ?? '';
+    const cls   = move.classification;
+    const color = CLASS_COLORS[cls] ?? '#888';
+    const label = CLASS_LABELS[cls] ?? cls;
+    const topMoves = move.engineData?.topMoves ?? [];
+    const wasBest = move.bestMove === move.played || cls === 'best';
+
+    // Decide which arrow to draw
+    let arrow = null;
+    if (currentArrowIdx >= 0 && topMoves[currentArrowIdx]) {
+      const sq = moveSquares(move.fen, topMoves[currentArrowIdx].uci);
+      if (sq) arrow = { ...sq, color: '#4caf50' };
+    } else {
+      const sq = moveSquares(move.fen, move.played);
+      if (sq) arrow = { ...sq, color };
+    }
+
+    // Engine lines (SAN)
+    const topLinesHtml = topMoves.map((m, j) => {
+      const san = uciToSan(move.fen, m.uci);
+      const active = currentArrowIdx === j ? ' ca-line-active' : '';
+      return `<button class="ca-top-line${active}" data-engine-idx="${j}">
+        <span class="ca-top-rank">${j + 1}</span>
+        <span class="ca-top-san">${san}</span>
+        <span class="ca-top-score">${fmtScore(m)}</span>
+      </button>`;
+    }).join('');
+
+    const turnLabel = move.color === 'White' ? `${move.moveNumber}.` : `${move.moveNumber}…`;
+    const bestSan = move.bestMove ? uciToSan(move.fen, move.bestMove) : null;
+
+    const evalLine = wasBest
+      ? `<div class="ca-mc-eval ca-eval-ok">✓ Engine's top choice</div>`
+      : `<div class="ca-mc-eval">Engine prefers <strong>${bestSan ?? move.bestMove}</strong>
+         <span class="ca-delta">Δ −${(move.scoreDelta ?? 0).toFixed(2)} pawns</span></div>`;
+
     el.innerHTML = `
       <div class="ca-current-card" style="border-left-color:${color}">
-        <div class="ca-current-header">
-          <span class="ca-move-num">${move.moveNumber}. ${move.color}</span>
-          <span class="ca-move-san">${move.played}</span>
-          <span class="ca-move-badge" style="background:${color}">${icon} ${move.classification}</span>
+        <div class="ca-mc-top">
+          <span class="ca-mc-turn">${turnLabel} <span class="ca-mc-side">${move.color}</span></span>
+          <span class="ca-mc-played">${move.played}</span>
+          <span class="ca-mc-badge ca-badge-${cls}">${label}</span>
         </div>
-        ${move.bestMove && move.bestMove !== move.played
-          ? `<div class="ca-best-move">Engine best: <strong>${move.bestMove}</strong>
-             ${move.scoreDelta ? `<span class="ca-delta">−${move.scoreDelta.toFixed(2)} pawns</span>` : ''}</div>`
-          : `<div class="ca-best-move" style="color:#4caf50">✓ Engine's top choice</div>`}
-        ${move.explanation
-          ? `<div class="ca-explanation">${move.explanation}</div>`
-          : ''}
+        ${evalLine}
+        ${renderMiniBoard(move.fen, arrow)}
+        ${topMoves.length ? `
+          <div class="ca-top-lines">
+            <div class="ca-top-lines-title">Top engine lines <span class="ca-hint">(click to show on board)</span></div>
+            ${topLinesHtml}
+          </div>` : ''}
       </div>`;
 
-    document.querySelectorAll('.ca-summary-row').forEach((r) => r.classList.remove('ca-active-row'));
-    const row = document.getElementById(`ca-row-${currentHalfMove}`);
-    if (row) { row.classList.add('ca-active-row'); row.scrollIntoView({ block: 'nearest' }); }
+    // Wire up engine-line clicks
+    el.querySelectorAll('.ca-top-line').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const idx = parseInt(btn.dataset.engineIdx);
+        currentArrowIdx = (currentArrowIdx === idx) ? -1 : idx;
+        renderCurrentMove();
+      });
+    });
+
+    // Sync active row in All Moves
+    document.querySelectorAll('.ca-move-cell').forEach((c) => c.classList.remove('ca-cell-active'));
+    const activeCell = document.querySelector(`.ca-move-cell[data-half="${currentHalfMove}"]`);
+    if (activeCell) {
+      activeCell.classList.add('ca-cell-active');
+      activeCell.scrollIntoView({ block: 'nearest' });
+    }
   }
 
   function renderSummaryList() {
     const el = document.getElementById('ca-summary');
     if (!el) return;
     el.innerHTML = '<div class="ca-summary-title">All moves</div>';
-    for (let i = 0; i < analyzedMoves.length; i++) {
-      const move  = analyzedMoves[i];
-      const color = CLASS_COLORS[move.classification] ?? '#888';
-      const icon  = CLASS_ICONS[move.classification]  ?? '';
-      const row   = document.createElement('div');
-      row.className = 'ca-summary-row';
-      row.id = `ca-row-${i}`;
-      row.innerHTML = `
-        <span class="ca-row-num">${move.moveNumber}${move.color === 'White' ? '.' : '…'}</span>
-        <span class="ca-row-san">${move.played}</span>
-        <span class="ca-row-badge" style="color:${color}">${icon}</span>`;
-      row.addEventListener('click', () => { currentHalfMove = i; renderCurrentMove(); });
-      el.appendChild(row);
+
+    const grid = document.createElement('div');
+    grid.className = 'ca-moves-grid';
+
+    // Group by move number; pair white + black
+    const byMoveNum = new Map();
+    analyzedMoves.forEach((m, i) => {
+      const e = byMoveNum.get(m.moveNumber) || { num: m.moveNumber };
+      if (m.color === 'White') e.white = { ...m, half: i };
+      else                     e.black = { ...m, half: i };
+      byMoveNum.set(m.moveNumber, e);
+    });
+
+    for (const row of byMoveNum.values()) {
+      const r = document.createElement('div');
+      r.className = 'ca-move-row';
+      r.innerHTML = `
+        <span class="ca-move-num">${row.num}.</span>
+        ${cellHtml(row.white)}
+        ${cellHtml(row.black)}`;
+      grid.appendChild(r);
     }
+    el.appendChild(grid);
+
+    grid.querySelectorAll('.ca-move-cell').forEach((c) => {
+      c.addEventListener('click', () => {
+        currentHalfMove = parseInt(c.dataset.half);
+        currentArrowIdx = -1;
+        renderCurrentMove();
+      });
+    });
+  }
+
+  function cellHtml(m) {
+    if (!m) return `<span class="ca-move-cell ca-cell-empty"></span>`;
+    const color = CLASS_COLORS[m.classification] ?? '#888';
+    return `<button class="ca-move-cell" data-half="${m.half}">
+      <span class="ca-cell-san">${m.played}</span>
+      <span class="ca-cell-dot" style="background:${color}" title="${CLASS_LABELS[m.classification]}"></span>
+    </button>`;
   }
 
   // ── Panel HTML ─────────────────────────────────────────────────────────────
@@ -473,16 +633,29 @@ Why was "${played}" a ${classification}? What makes "${bestMove}" better? Be spe
       </div>
       <div class="ca-body">
         <button class="ca-analyze-btn" id="ca-analyze-btn">Analyze Game</button>
+        <div class="ca-paste-fallback" id="ca-paste-fallback" style="display:none">
+          <div class="ca-paste-title">Couldn't read PGN automatically</div>
+          <div class="ca-paste-hint">On chess.com: click <strong>Share</strong> → <strong>PGN</strong> tab → copy. Paste below:</div>
+          <textarea class="ca-paste-textarea" id="ca-paste-textarea" placeholder="[Event &quot;...&quot;]&#10;1. e4 e5 2. Nf3 ..."></textarea>
+          <div class="ca-paste-actions">
+            <button class="ca-paste-submit" id="ca-paste-submit">Analyze pasted PGN</button>
+            <button class="ca-paste-cancel" id="ca-paste-cancel">Cancel</button>
+          </div>
+        </div>
         <div class="ca-status" id="ca-status"></div>
         <div class="ca-view" id="ca-view"></div>
         <div class="ca-log-section">
           <div class="ca-log-header">
             <span>Live Log</span>
-            <button class="ca-log-toggle" id="ca-log-toggle">▼</button>
+            <div class="ca-log-actions">
+              <button class="ca-log-btn" id="ca-log-copy" title="Copy log">⧉ Copy</button>
+              <button class="ca-log-toggle" id="ca-log-toggle">▼</button>
+            </div>
           </div>
           <div class="ca-log" id="ca-log"></div>
         </div>
         <div class="ca-summary" id="ca-summary"></div>
+        <div class="ca-kb-hint">← → navigate moves · click any move below</div>
       </div>`;
 
     document.body.appendChild(panel);
@@ -490,6 +663,22 @@ Why was "${played}" a ${classification}? What makes "${bestMove}" better? Be spe
 
     panel.querySelector('.ca-close').addEventListener('click', () => panel.remove());
     panel.querySelector('#ca-analyze-btn').addEventListener('click', startAnalysis);
+    panel.querySelector('#ca-log-copy').addEventListener('click', async () => {
+      const logEl = document.getElementById('ca-log');
+      if (!logEl) return;
+      const text = [...logEl.querySelectorAll('.ca-log-line')]
+        .map((l) => l.innerText.trim())
+        .join('\n');
+      try {
+        await navigator.clipboard.writeText(text);
+        const btn = document.getElementById('ca-log-copy');
+        const old = btn.textContent;
+        btn.textContent = '✓ Copied';
+        setTimeout(() => { btn.textContent = old; }, 1200);
+      } catch (e) {
+        log('Copy failed: ' + e.message, 'error');
+      }
+    });
     panel.querySelector('#ca-log-toggle').addEventListener('click', () => {
       const logEl = document.getElementById('ca-log');
       const btn   = document.getElementById('ca-log-toggle');
@@ -520,6 +709,31 @@ Why was "${played}" a ${classification}? What makes "${bestMove}" better? Be spe
     makeDraggable(panel);
     makeResizable(panel);
     watchMoveNavigation();
+    wireKeyboardNav();
+  }
+
+  function wireKeyboardNav() {
+    if (window.__caKbBound) return;
+    window.__caKbBound = true;
+    window.addEventListener('keydown', (e) => {
+      if (!analyzedMoves.length) return;
+      // Ignore if user is typing in an input/textarea
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (e.key === 'ArrowRight') {
+        if (currentHalfMove < analyzedMoves.length - 1) {
+          currentHalfMove++;
+          currentArrowIdx = -1;
+          renderCurrentMove();
+        }
+      } else if (e.key === 'ArrowLeft') {
+        if (currentHalfMove > 0) {
+          currentHalfMove--;
+          currentArrowIdx = -1;
+          renderCurrentMove();
+        }
+      }
+    }, true);
   }
 
   function makeDraggable(el) {
@@ -565,18 +779,23 @@ Why was "${played}" a ${classification}? What makes "${bestMove}" better? Be spe
     document.addEventListener('mouseup', () => { resizing = false; });
   }
 
-  // ── Trigger button ─────────────────────────────────────────────────────────
+  // ── Panel toggle (driven by toolbar icon) ──────────────────────────────────
 
-  function injectTriggerButton() {
-    if (document.getElementById('ca-trigger')) return;
-    const btn = document.createElement('button');
-    btn.id = 'ca-trigger';
-    btn.textContent = '♟ Analyze';
-    btn.addEventListener('click', injectPanel);
-    document.body.appendChild(btn);
+  function togglePanel() {
+    const existing = document.getElementById('chess-analyzer-panel');
+    if (existing) { existing.remove(); stopShareProbe(); return; }
+    injectPanel();
+    startShareProbe();
   }
 
-  const obs = new MutationObserver(injectTriggerButton);
-  obs.observe(document.body, { childList: true, subtree: true });
-  injectTriggerButton();
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg?.type === 'TOGGLE_PANEL') togglePanel();
+    if (msg?.type === 'ENGINE_RESULT') {
+      const cb = pendingAnalysis.get(msg.id);
+      if (cb) {
+        pendingAnalysis.delete(msg.id);
+        cb(msg.result);
+      }
+    }
+  });
 })();
