@@ -25,6 +25,17 @@
     } catch { return uci; }
   }
 
+  // Convert a SAN move ("Bb4", "O-O", "e8=Q") to UCI ("c5b4", ...) given the
+  // FEN of the position *before* the move. Returns null on failure.
+  function sanToUci(fen, san) {
+    if (!san) return null;
+    try {
+      const c = new Chess(fen);
+      const m = c.move(san, { sloppy: true });
+      return m ? m.from + m.to + (m.promotion ?? '') : null;
+    } catch { return null; }
+  }
+
   // Resolve a move (SAN or UCI) to {from, to} squares for arrow drawing.
   function moveSquares(fen, sanOrUci) {
     if (!sanOrUci) return null;
@@ -366,24 +377,44 @@
 
       const engineData = await analyzePosition(fen, 14, 3);
       const bestMove   = engineData.bestMove;
-      const bestScore  = engineData.topMoves[0]?.score ?? 0;
-      const playedData = engineData.topMoves.find((m) => m.uci === bestMove);
-      // If played move IS the best move, delta = 0; otherwise estimate
-      const playedScore = (engineData.topMoves[0]?.uci === bestMove) ? bestScore
-                        : (engineData.topMoves[1]?.score ?? bestScore - 0.5);
-      const delta = Math.max(0, bestScore - playedScore);
-      const classification = classifyDelta(delta);
 
       const topStr = engineData.topMoves.map((m, j) =>
         `#${j+1} ${m.uci} (${m.score > 0 ? '+' : ''}${m.score.toFixed(2)})`
       ).join(' | ');
 
       log(
-        `→ Best: <strong>${bestMove}</strong> | Top moves: ${topStr} | Classification: <span class="ca-log-${classification}">${classification}</span>`,
+        `→ Best: <strong>${bestMove}</strong> | Top moves: ${topStr}`,
         'result'
       );
 
-      results.push({ index: i, moveNumber, color, played: san, fen, engineData, bestMove, scoreDelta: delta, classification });
+      results.push({ index: i, moveNumber, color, played: san, fen, engineData, bestMove });
+    }
+
+    // Second pass: compute centipawn loss per move using the next position's
+    // eval. Stockfish scores are from the side-to-move's perspective, so the
+    // score the player actually achieved equals −(next position's best score).
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const bestScoreBefore = r.engineData.topMoves[0]?.score ?? 0;
+      const next = results[i + 1];
+      let achievedScore;
+      if (next) {
+        achievedScore = -(next.engineData.topMoves[0]?.score ?? 0);
+      } else {
+        // Last ply of the game — no successor. Try to find the played move in
+        // our top-3 lines; otherwise assume it scored at least as poorly as
+        // the worst line we have.
+        const userUci = sanToUci(r.fen, r.played);
+        const hit = r.engineData.topMoves.find((m) => m.uci === userUci);
+        achievedScore = hit ? hit.score : (r.engineData.topMoves.at(-1)?.score ?? bestScoreBefore);
+      }
+      const delta = Math.max(0, bestScoreBefore - achievedScore);
+      r.scoreDelta = delta;
+      r.classification = classifyDelta(delta);
+      log(
+        `Move ${r.moveNumber}${r.color === 'Black' ? '…' : '.'} ${r.played}: Δ ${delta.toFixed(2)} → <span class="ca-log-${r.classification}">${r.classification}</span>`,
+        'result'
+      );
     }
 
     analyzedMoves = results;
@@ -504,16 +535,19 @@
     const color = CLASS_COLORS[cls] ?? '#888';
     const label = CLASS_LABELS[cls] ?? cls;
     const topMoves = move.engineData?.topMoves ?? [];
-    const wasBest = move.bestMove === move.played || cls === 'best';
+    const playedUci = sanToUci(move.fen, move.played);
+    const wasBest = move.bestMove && playedUci === move.bestMove;
 
-    // Decide which arrow to draw
+    // Decide which arrow to draw. Default: engine's top move (so the user sees
+    // the recommendation). When a specific engine line is selected, show that
+    // one instead.
     let arrow = null;
     if (currentArrowIdx >= 0 && topMoves[currentArrowIdx]) {
       const sq = moveSquares(move.fen, topMoves[currentArrowIdx].uci);
       if (sq) arrow = { ...sq, color: '#4caf50' };
-    } else {
-      const sq = moveSquares(move.fen, move.played);
-      if (sq) arrow = { ...sq, color };
+    } else if (topMoves[0]) {
+      const sq = moveSquares(move.fen, topMoves[0].uci);
+      if (sq) arrow = { ...sq, color: '#4caf50' };
     }
 
     // Engine lines (SAN)
