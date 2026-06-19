@@ -45,6 +45,13 @@ function initWorker() {
   };
 
   worker.postMessage('uci');
+  // Configure once, up front. A big hash table + (if the build supports it)
+  // multiple threads is what makes repeated searches across one game fast.
+  // This asm.js build is single-threaded, so Threads is a no-op here but is
+  // harmless and future-proofs a multi-threaded engine swap.
+  const cores = Math.max(1, (self.navigator?.hardwareConcurrency || 1) - 1);
+  worker.postMessage(`setoption name Threads value ${cores}`);
+  worker.postMessage('setoption name Hash value 128');
   worker.postMessage('isready');
 }
 
@@ -84,7 +91,9 @@ chrome.runtime.onMessage.addListener((msg) => {
     buffer = [];
     collecting = true;
     worker.postMessage(`setoption name MultiPV value ${msg.multiPV ?? 3}`);
-    worker.postMessage('ucinewgame');
+    // NOTE: deliberately no `ucinewgame` here. Positions within one game share
+    // enormous search structure, so keeping the transposition table warm across
+    // moves makes each subsequent search far faster. `ucinewgame` would wipe it.
     worker.postMessage(`position fen ${msg.fen}`);
     worker.postMessage(`go depth ${msg.depth ?? 14}`);
   }

@@ -114,6 +114,39 @@
 
 .ca-status { font-size: 12px; }
 
+.ca-accuracy {
+  background: #0f1525;
+  border: 1px solid #2a2a4a;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+}
+.ca-acc-head {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 10px;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: #888;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #2a2a4a;
+  margin-bottom: 4px;
+}
+.ca-acc-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 2px 0;
+}
+.ca-acc-side { font-size: 11px; font-weight: 600; }
+.ca-acc-white { color: #e8e8f0; }
+.ca-acc-black { color: #9aa0b0; }
+.ca-acc-val { font-size: 15px; font-weight: 700; color: #fff; text-align: right; }
+.ca-acc-unit { font-size: 10px; font-weight: 500; color: #888; margin-left: 1px; }
+.ca-acc-elo { font-size: 12px; font-weight: 600; color: #7e9bff; text-align: right; min-width: 52px; }
+
 .ca-stats {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
@@ -208,6 +241,72 @@
   font-weight: 600;
 }
 
+/* Analysis progress card */
+.ca-progress {
+  margin: 14px 4px;
+  padding: 16px 14px;
+  background: #0f1525;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+}
+.ca-prog-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.ca-prog-phase {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e8e8e8;
+  flex: 1;
+}
+.ca-prog-count {
+  font-size: 12px;
+  font-weight: 700;
+  color: #e2b96f;
+  font-variant-numeric: tabular-nums;
+}
+.ca-prog-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(226, 185, 111, 0.25);
+  border-top-color: #e2b96f;
+  border-radius: 50%;
+  animation: ca-spin 0.7s linear infinite;
+  flex: none;
+}
+@keyframes ca-spin { to { transform: rotate(360deg); } }
+.ca-prog-bar {
+  position: relative;
+  height: 8px;
+  background: #1a2238;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.ca-prog-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #e2b96f, #f0cf95);
+  border-radius: 4px;
+  transition: width 0.25s ease;
+}
+/* Indeterminate: a sliding chunk for phases with no countable progress. */
+.ca-prog-indeterminate .ca-prog-fill {
+  width: 40%;
+  position: absolute;
+  animation: ca-slide 1.1s ease-in-out infinite;
+}
+@keyframes ca-slide {
+  0%   { left: -40%; }
+  100% { left: 100%; }
+}
+.ca-prog-sub {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #9aa3c0;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Mini board */
 .ca-mb {
   position: relative;
@@ -223,14 +322,25 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 22px;
+  /* font-size is set inline (proportional to square size) in renderMiniBoard */
   line-height: 1;
   user-select: none;
 }
 .ca-mb-sq.l { background: #ecd9b0; }
 .ca-mb-sq.d { background: #b58863; }
-.ca-mb-sq.pw { color: #fafafa; text-shadow: 0 0 1px #000, 0 1px 2px rgba(0,0,0,0.7); }
-.ca-mb-sq.pb { color: #1a1a2e; text-shadow: 0 0 1px rgba(255,255,255,0.2); }
+/* Crisp, high-contrast pieces: a real outline stroke around each glyph reads
+   far better at small sizes than a soft drop-shadow. White = light fill + dark
+   stroke, black = dark fill + light stroke, so both pop on either square. */
+.ca-mb-sq.pw {
+  color: #ffffff;
+  -webkit-text-stroke: 1.4px #16161e;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+}
+.ca-mb-sq.pb {
+  color: #141420;
+  -webkit-text-stroke: 1.2px rgba(255, 255, 255, 0.65);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
 .ca-mb-arrows {
   position: absolute;
   inset: 0;

@@ -111,6 +111,16 @@
       if (b.closest('[class*="share-menu"], [class*="modal"]')) continue;
       if ((b.textContent || '').trim().toLowerCase() === 'share') return b;
     }
+    // Last resort (review/analysis pages): a share control identified by a
+    // partial aria-label or a share-flavoured class/data attribute. Still skip
+    // anything inside the open share modal so we don't click its inert element.
+    for (const el of document.querySelectorAll(
+      'button[aria-label*="share" i], a[role="button"][aria-label*="share" i], ' +
+      '[data-cy*="share" i], button[class*="share" i]'
+    )) {
+      if (el.closest('[class*="share-menu"], [class*="modal"]')) continue;
+      return el;
+    }
     return null;
   }
 
@@ -248,17 +258,33 @@
     return pasted;
   }
 
-  // ── Share-button presence probe (gates Analyze button) ────────────────────
-  // Finished games on chess.com expose a Share button. Live in-progress games
-  // do not. We poll on a low-frequency interval instead of a MutationObserver
-  // because chess.com mutates the DOM heavily (clocks, animations, move list)
-  // and observing the whole subtree freezes the page.
+  // ── Analyze-button gating ──────────────────────────────────────────────────
+  // We enable "Analyze Game" once the game is over. Two independent signals,
+  // either of which is sufficient:
+  //   1. The URL is an analysis/review/archived-game page — the game is over by
+  //      definition there (e.g. /analysis/game/live/<id>/review).
+  //   2. A top-level Share button is present. Finished games on the normal game
+  //      page expose one; live in-progress games do not.
+  // The URL check matters because the review page lays its controls out
+  // differently and findShareButton() can miss its share control, which used to
+  // leave the button stuck on "Waiting for game to end…" on a finished game.
+  // We poll on a low-frequency interval instead of a MutationObserver because
+  // chess.com mutates the DOM heavily (clocks, animations, move list) and
+  // observing the whole subtree freezes the page.
+
+  function isFinishedGamePage() {
+    return /\/(analysis|review|archive)\b/i.test(location.pathname);
+  }
+
+  function isGameReady() {
+    return isFinishedGamePage() || !!findShareButton();
+  }
 
   let lastShareReady = null;
   function updateAnalyzeButtonState() {
     const btn = document.getElementById('ca-analyze-btn');
     if (!btn) return;
-    const ready = !!findShareButton();
+    const ready = isGameReady();
     if (ready === lastShareReady) return;
     lastShareReady = ready;
     btn.disabled = !ready;
@@ -278,20 +304,45 @@
   }
 
   // ── Move classification ────────────────────────────────────────────────────
+  // We classify on the *change in win probability*, not raw centipawns. A
+  // 0.7-pawn drop is meaningless at ±8 but decisive near 0.0 — pawn thresholds
+  // can't tell those apart, which is what made the old logic over-flag.
 
-  const CLASS_THRESHOLDS = [
-    [0.2,  'best'],
-    [0.5,  'good'],
-    [1.0,  'inaccuracy'],
-    [2.0,  'mistake'],
-    [Infinity, 'blunder'],
-  ];
-
-  function classifyDelta(delta) {
-    for (const [threshold, label] of CLASS_THRESHOLDS) {
-      if (delta < threshold) return label;
+  // Convert one engine line {score (pawns), isMate, mateIn} to a 0–100 win
+  // probability. `sign` flips perspective: +1 = the side to move in the line's
+  // own position, −1 = the opponent (used when reading the *next* position).
+  function evalToWinPct(line, sign = 1) {
+    if (!line) return 50;
+    if (line.isMate) {
+      const m = (line.mateIn ?? 0) * sign; // >0 → mover mates, <0 → gets mated
+      return m > 0 ? 100 : 0;
     }
+    const cp = line.score * 100 * sign;    // line.score is in pawns
+    return 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * cp)) - 1);
+  }
+
+  // Map a win-probability loss (0–100) to one of the five labels. A move that
+  // matched the engine's top choice is always 'best' — this keeps the badge and
+  // the "✓ Engine's top choice" line from ever disagreeing.
+  function classifyByWinLoss(winLoss, wasBest) {
+    if (wasBest || winLoss < 2) return 'best';
+    if (winLoss < 5)            return 'good';
+    if (winLoss < 10)           return 'inaccuracy';
+    if (winLoss < 20)           return 'mistake';
     return 'blunder';
+  }
+
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  // Per-move accuracy from win-probability loss (lichess formula).
+  function moveAccuracy(winLoss) {
+    return clamp(103.1668 * Math.exp(-0.04354 * winLoss) - 3.1669, 0, 100);
+  }
+
+  // Rough, clearly-approximate game Elo from accuracy. No engine produces a
+  // rigorous game rating; constants are tunable.
+  function estimateElo(accuracy) {
+    return clamp(Math.round((accuracy - 30) * 35), 100, 2900);
   }
 
   // ── Live log ───────────────────────────────────────────────────────────────
@@ -321,15 +372,21 @@
     const summaryEl = document.getElementById('ca-summary');
 
     btn.disabled = true;
+    btn.textContent = 'Analyzing…';
     viewEl.innerHTML = '';
     summaryEl.innerHTML = '';
     logClear();
 
+    // Restore the button on any exit path (error or completion).
+    const finish = () => { btn.disabled = false; btn.textContent = 'Analyze Game'; };
+
     // 1. Load PGN
+    renderProgress({ phase: 'Reading game…' });
     const pgn = await getPGN();
     if (!pgn) {
       log('Could not read game — make sure it is finished and you are on /game/live/... or /game/daily/...', 'error');
-      btn.disabled = false;
+      renderProgress(null);
+      finish();
       return;
     }
 
@@ -348,7 +405,8 @@
       });
     } catch (e) {
       log('PGN parse error: ' + e.message, 'error');
-      btn.disabled = false;
+      renderProgress(null);
+      finish();
       return;
     }
 
@@ -356,13 +414,15 @@
 
     // 3. Init Stockfish
     if (!sfReady) {
+      renderProgress({ phase: 'Starting Stockfish engine…' });
       log('Starting Stockfish engine...', 'info');
       try {
         await initStockfish();
         log('Stockfish ready ✓', 'ok');
       } catch (e) {
         log('Stockfish failed to start: ' + e.message, 'error');
-        btn.disabled = false;
+        renderProgress(null);
+        finish();
         return;
       }
     } else {
@@ -373,9 +433,11 @@
     const results = [];
     for (let i = 0; i < positions.length; i++) {
       const { fen, san, moveNumber, color } = positions[i];
+      renderProgress({ phase: 'Analyzing moves', current: i, total: positions.length,
+                       label: `${moveNumber}${color === 'Black' ? '…' : '.'} ${san}` });
       log(`[${i + 1}/${positions.length}] Stockfish analyzing move ${moveNumber}. ${color}: ${san}...`, 'engine');
 
-      const engineData = await analyzePosition(fen, 14, 3);
+      const engineData = await analyzePosition(fen, 12, 3);
       const bestMove   = engineData.bestMove;
 
       const topStr = engineData.topMoves.map((m, j) =>
@@ -390,29 +452,47 @@
       results.push({ index: i, moveNumber, color, played: san, fen, engineData, bestMove });
     }
 
-    // Second pass: compute centipawn loss per move using the next position's
-    // eval. Stockfish scores are from the side-to-move's perspective, so the
-    // score the player actually achieved equals −(next position's best score).
+    // Second pass: classify each move by its win-probability loss. We compare
+    // the win% of the engine's best line at this position against the win% the
+    // player actually achieved (read from the *next* position's best line,
+    // flipped to the mover's perspective). Playing the engine's top move pins
+    // the loss to exactly 0 — the two searches won't be re-compared, so search
+    // instability can no longer manufacture a fake "loss" on the best move.
+    renderProgress({ phase: 'Classifying moves…' });
     for (let i = 0; i < results.length; i++) {
       const r = results[i];
-      const bestScoreBefore = r.engineData.topMoves[0]?.score ?? 0;
-      const next = results[i + 1];
-      let achievedScore;
-      if (next) {
-        achievedScore = -(next.engineData.topMoves[0]?.score ?? 0);
+      const bestLine = r.engineData.topMoves[0] ?? null;
+      const bestScoreBefore = bestLine?.score ?? 0;
+      const playedUci = sanToUci(r.fen, r.played);
+      const wasBest = !!r.bestMove && playedUci === r.bestMove;
+
+      const winBefore = evalToWinPct(bestLine, 1);
+      let winAfter, achievedScore;
+      if (wasBest) {
+        winAfter = winBefore;
+        achievedScore = bestScoreBefore;
       } else {
-        // Last ply of the game — no successor. Try to find the played move in
-        // our top-3 lines; otherwise assume it scored at least as poorly as
-        // the worst line we have.
-        const userUci = sanToUci(r.fen, r.played);
-        const hit = r.engineData.topMoves.find((m) => m.uci === userUci);
-        achievedScore = hit ? hit.score : (r.engineData.topMoves.at(-1)?.score ?? bestScoreBefore);
+        const next = results[i + 1];
+        if (next) {
+          const nextLine = next.engineData.topMoves[0] ?? null;
+          winAfter = evalToWinPct(nextLine, -1); // opponent's line, flipped
+          achievedScore = -(nextLine?.score ?? 0);
+        } else {
+          // Last ply of the game — no successor. Use the played move from our
+          // own top lines if present, else the worst line we have.
+          const hit = r.engineData.topMoves.find((m) => m.uci === playedUci);
+          const line = hit ?? r.engineData.topMoves.at(-1) ?? bestLine;
+          winAfter = evalToWinPct(line, 1);
+          achievedScore = line?.score ?? bestScoreBefore;
+        }
       }
-      const delta = Math.max(0, bestScoreBefore - achievedScore);
-      r.scoreDelta = delta;
-      r.classification = classifyDelta(delta);
+
+      r.scoreDelta = Math.max(0, bestScoreBefore - achievedScore);
+      r.winLoss = Math.max(0, winBefore - winAfter);
+      r.wasBest = wasBest;
+      r.classification = classifyByWinLoss(r.winLoss, wasBest);
       log(
-        `Move ${r.moveNumber}${r.color === 'Black' ? '…' : '.'} ${r.played}: Δ ${delta.toFixed(2)} → <span class="ca-log-${r.classification}">${r.classification}</span>`,
+        `Move ${r.moveNumber}${r.color === 'Black' ? '…' : '.'} ${r.played}: −${r.winLoss.toFixed(1)}% win → <span class="ca-log-${r.classification}">${r.classification}</span>`,
         'result'
       );
     }
@@ -425,13 +505,77 @@
     log(`─── Analysis complete ───`, 'section');
     log(`${counts.blunder} blunders · ${counts.mistake} mistakes · ${counts.inaccuracy} inaccuracies · ${counts.best + counts.good} good/best`, 'summary');
 
-    statusEl.innerHTML = renderStatsHtml(counts);
+    // Per-player accuracy & estimated Elo
+    const perPlayer = {};
+    for (const side of ['White', 'Black']) {
+      const moves = analyzedMoves.filter((m) => m.color === side);
+      if (!moves.length) continue;
+      const accuracy = moves.reduce((s, m) => s + moveAccuracy(m.winLoss ?? 0), 0) / moves.length;
+      const acpl     = moves.reduce((s, m) => s + (m.scoreDelta ?? 0) * 100, 0) / moves.length;
+      perPlayer[side] = { accuracy, acpl, elo: estimateElo(accuracy) };
+    }
+    for (const side of ['White', 'Black']) {
+      const p = perPlayer[side];
+      if (p) log(`${side}: ${p.accuracy.toFixed(1)}% accuracy · ≈${p.elo} Elo`, 'summary');
+    }
+
+    statusEl.innerHTML = renderAccuracyHtml(perPlayer) + renderStatsHtml(counts);
 
     currentHalfMove = getCurrentHalfMoveFromURL();
     currentArrowIdx = -1;
+    renderProgress(null);     // cleared visually by renderCurrentMove below
     renderCurrentMove();
     renderSummaryList();
-    btn.disabled = false;
+    finish();
+  }
+
+  // Render (or clear) the in-progress analysis card in the main view area.
+  // Pass null to clear. `state` = { phase, current?, total?, label? }.
+  function renderProgress(state) {
+    const el = document.getElementById('ca-view');
+    if (!el) return;
+    if (!state) { el.innerHTML = ''; return; }
+
+    const { phase, current, total, label } = state;
+    const determinate = Number.isFinite(current) && Number.isFinite(total) && total > 0;
+    const done = determinate ? current : 0;
+    const pct  = determinate ? Math.round((done / total) * 100) : 0;
+
+    const counter = determinate ? `<span class="ca-prog-count">${done} / ${total}</span>` : '';
+    const sub     = determinate && label
+      ? `<div class="ca-prog-sub">Move ${label}</div>`
+      : '';
+    const bar = determinate
+      ? `<div class="ca-prog-bar"><div class="ca-prog-fill" style="width:${pct}%"></div></div>`
+      : `<div class="ca-prog-bar ca-prog-indeterminate"><div class="ca-prog-fill"></div></div>`;
+
+    el.innerHTML = `
+      <div class="ca-progress">
+        <div class="ca-prog-top">
+          <span class="ca-prog-spinner"></span>
+          <span class="ca-prog-phase">${phase}</span>
+          ${counter}
+        </div>
+        ${bar}
+        ${sub}
+      </div>`;
+  }
+
+  function renderAccuracyHtml(perPlayer) {
+    const row = (side, p) => {
+      if (!p) return '';
+      return `<div class="ca-acc-row">
+        <span class="ca-acc-side ca-acc-${side.toLowerCase()}">${side}</span>
+        <span class="ca-acc-val">${p.accuracy.toFixed(1)}<span class="ca-acc-unit">%</span></span>
+        <span class="ca-acc-elo" title="Estimated rating (approximate)">≈ ${p.elo}</span>
+      </div>`;
+    };
+    const rows = row('White', perPlayer.White) + row('Black', perPlayer.Black);
+    if (!rows) return '';
+    return `<div class="ca-accuracy">
+      <div class="ca-acc-head"><span>Accuracy</span><span>Est. Elo</span></div>
+      ${rows}
+    </div>`;
   }
 
   function renderStatsHtml(counts) {
@@ -482,7 +626,7 @@
   function renderMiniBoard(fen, arrow) {
     let board;
     try { board = new Chess(fen).board(); } catch { return ''; }
-    const SQ = 28;
+    const SQ = 38;
     const size = SQ * 8;
     let cells = '';
     for (let r = 0; r < 8; r++) {
@@ -517,7 +661,7 @@
         </svg>`;
     }
     return `<div class="ca-mb" style="width:${size}px;height:${size}px">
-      <div class="ca-mb-board" style="grid-template-columns:repeat(8,${SQ}px);grid-template-rows:repeat(8,${SQ}px)">${cells}</div>
+      <div class="ca-mb-board" style="grid-template-columns:repeat(8,${SQ}px);grid-template-rows:repeat(8,${SQ}px);font-size:${Math.round(SQ * 0.82)}px">${cells}</div>
       ${arrowSvg}
     </div>`;
   }
@@ -535,8 +679,7 @@
     const color = CLASS_COLORS[cls] ?? '#888';
     const label = CLASS_LABELS[cls] ?? cls;
     const topMoves = move.engineData?.topMoves ?? [];
-    const playedUci = sanToUci(move.fen, move.played);
-    const wasBest = move.bestMove && playedUci === move.bestMove;
+    const wasBest = move.wasBest ?? (move.bestMove && sanToUci(move.fen, move.played) === move.bestMove);
 
     // Decide which arrow to draw. Default: engine's top move (so the user sees
     // the recommendation). When a specific engine line is selected, show that
@@ -693,7 +836,6 @@
       </div>`;
 
     document.body.appendChild(panel);
-    makeDraggable(panel);
 
     panel.querySelector('.ca-close').addEventListener('click', () => panel.remove());
     panel.querySelector('#ca-analyze-btn').addEventListener('click', startAnalysis);
@@ -721,29 +863,92 @@
       btn.textContent = hide ? '►' : '▼';
     });
 
-    // Dock ↔ Float toggle
-    let docked = true;
+    // Dock ↔ Float toggle. Floating means free positioning + size; docked is the
+    // full-height right sidebar (CSS default). Current mode lives on
+    // panel.dataset.docked so the save/drag/resize helpers can read it.
     panel.querySelector('#ca-dock-btn').addEventListener('click', () => {
-      docked = !docked;
-      if (docked) {
-        panel.style.cssText = '';  // reset to CSS defaults (sidebar)
-        panel.querySelector('#ca-dock-btn').textContent = '⊞ Float';
-        panel.querySelector('.ca-header').style.cursor = 'grab';
+      const nowDocked = panel.dataset.docked === 'false'; // about to flip
+      if (nowDocked) {
+        applyPanelState(panel, { docked: true });
       } else {
+        // Floating: seed from the panel's current on-screen geometry.
         const r = panel.getBoundingClientRect();
-        panel.style.top    = r.top + 'px';
-        panel.style.right  = 'auto';
-        panel.style.left   = r.left + 'px';
-        panel.style.height = '600px';
-        panel.style.width  = '360px';
-        panel.querySelector('#ca-dock-btn').textContent = '⊟ Dock';
+        applyPanelState(panel, { docked: false, left: r.left, top: r.top, width: r.width, height: 600 });
       }
+      savePanelState(panel);
     });
 
+    // Restore the last-used position/size/dock state before wiring interactions.
+    applyPanelState(panel, loadPanelState());
     makeDraggable(panel);
     makeResizable(panel);
+
+    // Keep the panel on-screen if the window is resized smaller.
+    window.addEventListener('resize', () => {
+      if (panel.dataset.docked === 'false') { clampToViewport(panel); savePanelState(panel); }
+    });
+
     watchMoveNavigation();
     wireKeyboardNav();
+  }
+
+  // ── Panel position/size persistence ────────────────────────────────────────
+  // Remember where the user put the panel (and whether it's floating) across
+  // page loads. Stored per-origin in localStorage.
+  const PANEL_STATE_KEY = 'caPanelState';
+
+  function loadPanelState() {
+    try { return JSON.parse(localStorage.getItem(PANEL_STATE_KEY) || 'null'); }
+    catch { return null; }
+  }
+
+  function savePanelState(panel) {
+    try {
+      const docked = panel.dataset.docked !== 'false';
+      const state = { docked, width: panel.offsetWidth };
+      if (!docked) {
+        const r = panel.getBoundingClientRect();
+        state.left = r.left; state.top = r.top; state.height = panel.offsetHeight;
+      }
+      localStorage.setItem(PANEL_STATE_KEY, JSON.stringify(state));
+    } catch { /* storage may be blocked; non-fatal */ }
+  }
+
+  // Apply a saved (or default) state to the panel's inline styles.
+  function applyPanelState(panel, state) {
+    const docked  = !state || state.docked !== false;
+    const dockBtn = panel.querySelector('#ca-dock-btn');
+    const header  = panel.querySelector('.ca-header');
+    panel.dataset.docked = String(docked);
+
+    if (docked) {
+      panel.style.cssText = '';                       // back to the CSS sidebar
+      if (state?.width) panel.style.width = state.width + 'px';
+      if (dockBtn) dockBtn.textContent = '⊞ Float';
+      if (header) header.style.cursor = 'default';
+    } else {
+      const w = state.width  ?? 360;
+      const h = state.height ?? 600;
+      panel.style.right  = 'auto';
+      panel.style.width  = w + 'px';
+      panel.style.height = h + 'px';
+      panel.style.left   = (state.left ?? (window.innerWidth - w - 20)) + 'px';
+      panel.style.top    = (state.top  ?? 80) + 'px';
+      if (dockBtn) dockBtn.textContent = '⊟ Dock';
+      if (header) header.style.cursor = 'grab';
+      clampToViewport(panel);
+    }
+  }
+
+  // Keep a floating panel fully inside the viewport (header always reachable).
+  function clampToViewport(panel) {
+    const r = panel.getBoundingClientRect();
+    const maxLeft = Math.max(0, window.innerWidth  - r.width);
+    const maxTop  = Math.max(0, window.innerHeight - 40);
+    const left = Math.min(Math.max(0, r.left), maxLeft);
+    const top  = Math.min(Math.max(0, r.top),  maxTop);
+    panel.style.left = left + 'px';
+    panel.style.top  = top  + 'px';
   }
 
   function wireKeyboardNav() {
@@ -776,6 +981,11 @@
 
     header.addEventListener('mousedown', (e) => {
       if (e.target.tagName === 'BUTTON') return; // don't drag on button clicks
+      // Dragging a docked panel implicitly floats it.
+      if (el.dataset.docked !== 'false') {
+        const r = el.getBoundingClientRect();
+        applyPanelState(el, { docked: false, left: r.left, top: r.top, width: r.width, height: r.height });
+      }
       dragging = true;
       const r = el.getBoundingClientRect();
       ox = e.clientX - r.left;
@@ -789,8 +999,11 @@
       el.style.top  = e.clientY - oy + 'px';
     });
     document.addEventListener('mouseup', () => {
+      if (!dragging) return;
       dragging = false;
       header.style.cursor = 'grab';
+      clampToViewport(el);
+      savePanelState(el);
     });
   }
 
@@ -810,7 +1023,11 @@
       const dx = startX - e.clientX;
       el.style.width = Math.max(280, startW + dx) + 'px';
     });
-    document.addEventListener('mouseup', () => { resizing = false; });
+    document.addEventListener('mouseup', () => {
+      if (!resizing) return;
+      resizing = false;
+      savePanelState(el);
+    });
   }
 
   // ── Panel toggle (driven by toolbar icon) ──────────────────────────────────
