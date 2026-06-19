@@ -606,6 +606,10 @@
           renderCurrentMove();
         }
       }
+      // Re-sync the board arrow every tick: chess.com re-renders its board on
+      // navigation/animation (which can drop our overlay), and the placement
+      // match keeps the arrow aligned with whatever position is shown.
+      if (analyzedMoves.length > 0) syncBoardArrow();
     }, 200);
   }
 
@@ -613,9 +617,6 @@
 
   const CLASS_COLORS = { best: '#4caf50', good: '#8bc34a', inaccuracy: '#ff9800', mistake: '#f44336', blunder: '#9c27b0', unknown: '#888' };
   const CLASS_LABELS = { best: 'Best', good: 'Good', inaccuracy: 'Inaccuracy', mistake: 'Mistake', blunder: 'Blunder' };
-  // Always use filled glyphs; color white vs. black via CSS.
-  const PIECE_GLYPH  = { p: '♟', n: '♞', b: '♝', r: '♜', q: '♛', k: '♚',
-                         P: '♟', N: '♞', B: '♝', R: '♜', Q: '♛', K: '♚' };
 
   function fmtScore(m) {
     if (!m) return '';
@@ -623,47 +624,181 @@
     return (m.score > 0 ? '+' : '') + m.score.toFixed(2);
   }
 
-  function renderMiniBoard(fen, arrow) {
-    let board;
-    try { board = new Chess(fen).board(); } catch { return ''; }
-    const SQ = 38;
-    const size = SQ * 8;
-    let cells = '';
-    for (let r = 0; r < 8; r++) {
+  // ── Best-move arrow on chess.com's real board ───────────────────────────────
+  // Overlay an engine arrow on chess.com's board, like its native Game Review.
+  // To stay correct regardless of which ply chess.com is displaying, we read the
+  // board's actual piece placement from the DOM and match it to the analyzed
+  // position — the arrow only shows when it lines up with the pieces on screen.
+
+  const CA_BOARD_SVG_ID = 'ca-board-arrow';
+  let lastBoardArrowKey = null;
+
+  function findChessBoard() {
+    return document.querySelector('wc-chess-board, chess-board, #board-single, .board');
+  }
+
+  function fenPlacement(fen) { return (fen || '').split(' ')[0]; }
+
+  // Build a FEN placement string from chess.com's DOM pieces (.piece .square-FR).
+  function readBoardPlacement(boardEl) {
+    const grid = Array.from({ length: 8 }, () => Array(8).fill(''));
+    let found = 0;
+    for (const pc of boardEl.querySelectorAll('.piece')) {
+      const cls = pc.getAttribute('class') || '';
+      const sq  = cls.match(/square-(\d)(\d)/);
+      const tp  = cls.match(/\b([wb])([pnbrqk])\b/);
+      if (!sq || !tp) continue;
+      const file = +sq[1] - 1, rank = +sq[2] - 1;
+      if (file < 0 || file > 7 || rank < 0 || rank > 7) continue;
+      grid[rank][file] = tp[1] === 'w' ? tp[2].toUpperCase() : tp[2];
+      found++;
+    }
+    if (!found) return null;
+    const rows = [];
+    for (let r = 7; r >= 0; r--) {
+      let row = '', empty = 0;
       for (let f = 0; f < 8; f++) {
-        const piece = board[r][f];
-        const cls = ((r + f) % 2 === 0) ? 'l' : 'd';
-        const glyph = piece ? PIECE_GLYPH[piece.color === 'w' ? piece.type.toUpperCase() : piece.type] : '';
-        const colorCls = piece ? (piece.color === 'w' ? 'pw' : 'pb') : '';
-        cells += `<div class="ca-mb-sq ${cls} ${colorCls}">${glyph}</div>`;
+        const c = grid[r][f];
+        if (!c) empty++; else { if (empty) { row += empty; empty = 0; } row += c; }
+      }
+      if (empty) row += empty;
+      rows.push(row);
+    }
+    return rows.join('/');
+  }
+
+  function boardIsFlipped(boardEl) { return boardEl.classList.contains('flipped'); }
+
+  // Square (e.g. "e4") → center point in 0..100 board space, honoring flip.
+  function squareCenter(square, flipped) {
+    const file = square.charCodeAt(0) - 97;   // 0..7 (a..h)
+    const rank = parseInt(square[1], 10) - 1;  // 0..7 (1..8)
+    const col  = flipped ? 7 - file : file;
+    const row  = flipped ? rank : 7 - rank;    // rows from top
+    return { x: (col + 0.5) * 12.5, y: (row + 0.5) * 12.5 };
+  }
+
+  function clearBoardArrow() {
+    const svg = document.getElementById(CA_BOARD_SVG_ID);
+    if (svg) svg.remove();
+    lastBoardArrowKey = null;
+  }
+
+  // Short symbol shown inside the move-quality badge, per classification.
+  const CLASS_SYMBOL = { best: '★', good: '✓', inaccuracy: '?!', mistake: '?', blunder: '??' };
+
+  // Render the overlay: an optional best-move arrow + an optional quality badge
+  // on the square of the move that was just played. Pass null parts to omit.
+  function drawBoardOverlay(boardEl, { arrow, badge }) {
+    if (getComputedStyle(boardEl).position === 'static') boardEl.style.position = 'relative';
+    let svg = boardEl.querySelector('#' + CA_BOARD_SVG_ID);
+    if (!svg) {
+      svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.id = CA_BOARD_SVG_ID;
+      svg.setAttribute('viewBox', '0 0 100 100');
+      svg.setAttribute('preserveAspectRatio', 'none');
+      svg.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:30;';
+      boardEl.appendChild(svg);
+    }
+    const f = boardIsFlipped(boardEl);
+
+    let arrowSvg = '';
+    if (arrow) {
+      const a = squareCenter(arrow.from, f), b = squareCenter(arrow.to, f);
+      arrowSvg = `
+        <defs>
+          <marker id="ca-bm-head" viewBox="0 0 10 10" refX="6.5" refY="5"
+                  markerWidth="3" markerHeight="3" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="${arrow.color}"></path>
+          </marker>
+        </defs>
+        <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"
+              stroke="${arrow.color}" stroke-width="2.2" stroke-linecap="round"
+              marker-end="url(#ca-bm-head)" opacity="0.85"></line>`;
+    }
+
+    let badgeSvg = '';
+    if (badge) {
+      const c = squareCenter(badge.square, f);
+      const cx = c.x + 4.2, cy = c.y - 4.2;   // top-right corner of the square
+      const sym = CLASS_SYMBOL[badge.cls] ?? '';
+      badgeSvg = `
+        <circle cx="${cx}" cy="${cy}" r="3.5" fill="${badge.color}"
+                stroke="#fff" stroke-width="0.5"></circle>
+        <text x="${cx}" y="${cy}" fill="#fff" font-size="3.4" font-weight="700"
+              text-anchor="middle" dominant-baseline="central"
+              font-family="-apple-system, sans-serif">${sym}</text>`;
+    }
+
+    svg.innerHTML = arrowSvg + badgeSvg;
+  }
+
+  // Destination square + classification of a played move (for the badge).
+  function playedMoveBadge(move) {
+    if (!move) return null;
+    const sq = moveSquares(move.fen, move.played);
+    if (!sq) return null;
+    return { square: sq.to, cls: move.classification, color: CLASS_COLORS[move.classification] ?? '#888' };
+  }
+
+  // Render the arrow + quality badge for whatever position chess.com is showing.
+  function syncBoardArrow() {
+    const boardEl = findChessBoard();
+    if (!boardEl || !analyzedMoves.length) { clearBoardArrow(); return; }
+    const placement = readBoardPlacement(boardEl);
+    if (!placement) { clearBoardArrow(); return; }
+
+    // Match the on-screen pieces to an analyzed (pre-move) position. Test the
+    // likely plies first (chess.com may show the pre- or post-move position),
+    // then scan. analyzedMoves[idx].fen is "before move idx" = "after move idx-1".
+    let idx = -1;
+    for (const i of [currentHalfMove, currentHalfMove + 1, currentHalfMove - 1]) {
+      if (analyzedMoves[i] && fenPlacement(analyzedMoves[i].fen) === placement) { idx = i; break; }
+    }
+    if (idx < 0) {
+      for (let i = 0; i < analyzedMoves.length; i++) {
+        if (fenPlacement(analyzedMoves[i].fen) === placement) { idx = i; break; }
       }
     }
-    let arrowSvg = '';
-    if (arrow?.from && arrow?.to) {
-      const toXY = (sq) => ({
-        x: (sq.charCodeAt(0) - 97) * SQ + SQ / 2,
-        y: (8 - parseInt(sq[1])) * SQ + SQ / 2,
-      });
-      const a = toXY(arrow.from), b = toXY(arrow.to);
-      const color = arrow.color || '#4caf50';
-      const mid = Math.random().toString(36).slice(2, 8);
-      arrowSvg = `
-        <svg class="ca-mb-arrows" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
-          <defs>
-            <marker id="ah-${mid}" viewBox="0 0 10 10" refX="7" refY="5"
-                    markerWidth="4.5" markerHeight="4.5" orient="auto-start-reverse">
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="${color}" />
-            </marker>
-          </defs>
-          <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"
-                stroke="${color}" stroke-width="3.5" stroke-linecap="round"
-                marker-end="url(#ah-${mid})" opacity="0.88" />
-        </svg>`;
+
+    // Identify the move that was actually PLAYED to reach the displayed position.
+    // The board shows the position after that move, so the badge and the
+    // "engine preferred instead" arrow both belong to it.
+    let playedIdx = -1;
+    if (idx >= 0) {
+      playedIdx = idx - 1;                       // analyzedMoves[idx].fen = after move idx-1
+    } else {
+      // Terminal position (after the final move) has no pre-move fen to match.
+      const lastI = analyzedMoves.length - 1;
+      const last  = analyzedMoves[lastI];
+      let termPlacement = null;
+      try { const c = new Chess(last.fen); c.move(last.played, { sloppy: true }); termPlacement = fenPlacement(c.fen()); } catch {}
+      if (termPlacement === placement) playedIdx = lastI;
     }
-    return `<div class="ca-mb" style="width:${size}px;height:${size}px">
-      <div class="ca-mb-board" style="grid-template-columns:repeat(8,${SQ}px);grid-template-rows:repeat(8,${SQ}px);font-size:${Math.round(SQ * 0.82)}px">${cells}</div>
-      ${arrowSvg}
-    </div>`;
+    if (playedIdx < 0) { clearBoardArrow(); return; }  // initial position / no match
+
+    const played = analyzedMoves[playedIdx];
+    const badge  = playedMoveBadge(played);
+
+    // Arrow = the engine's preferred move INSTEAD of the one played. Only shown
+    // when the played move wasn't best (a best move needs no correction). A line
+    // the user explicitly clicked in the panel overrides this.
+    let arrow = null;
+    const topMoves = played.engineData?.topMoves ?? [];
+    const explicit = (playedIdx === currentHalfMove && currentArrowIdx >= 0);
+    const useIdx   = explicit ? currentArrowIdx : (played.wasBest ? -1 : 0);
+    if (useIdx >= 0) {
+      const uci = topMoves[useIdx]?.uci;
+      const sq  = uci ? moveSquares(played.fen, uci) : null;
+      if (sq) arrow = { from: sq.from, to: sq.to, color: '#4caf50' };
+    }
+
+    if (!arrow && !badge) { clearBoardArrow(); return; }
+
+    const key = [arrow?.from, arrow?.to, badge?.square, badge?.cls, boardIsFlipped(boardEl)].join('-');
+    if (key === lastBoardArrowKey && boardEl.querySelector('#' + CA_BOARD_SVG_ID)) return;
+    lastBoardArrowKey = key;
+    drawBoardOverlay(boardEl, { arrow, badge });
   }
 
   function renderCurrentMove() {
@@ -680,18 +815,6 @@
     const label = CLASS_LABELS[cls] ?? cls;
     const topMoves = move.engineData?.topMoves ?? [];
     const wasBest = move.wasBest ?? (move.bestMove && sanToUci(move.fen, move.played) === move.bestMove);
-
-    // Decide which arrow to draw. Default: engine's top move (so the user sees
-    // the recommendation). When a specific engine line is selected, show that
-    // one instead.
-    let arrow = null;
-    if (currentArrowIdx >= 0 && topMoves[currentArrowIdx]) {
-      const sq = moveSquares(move.fen, topMoves[currentArrowIdx].uci);
-      if (sq) arrow = { ...sq, color: '#4caf50' };
-    } else if (topMoves[0]) {
-      const sq = moveSquares(move.fen, topMoves[0].uci);
-      if (sq) arrow = { ...sq, color: '#4caf50' };
-    }
 
     // Engine lines (SAN)
     const topLinesHtml = topMoves.map((m, j) => {
@@ -720,7 +843,6 @@
           <span class="ca-mc-badge ca-badge-${cls}">${label}</span>
         </div>
         ${evalLine}
-        ${renderMiniBoard(move.fen, arrow)}
         ${topMoves.length ? `
           <div class="ca-top-lines">
             <div class="ca-top-lines-title">Top engine lines <span class="ca-hint">(click to show on board)</span></div>
@@ -744,6 +866,9 @@
       activeCell.classList.add('ca-cell-active');
       activeCell.scrollIntoView({ block: 'nearest' });
     }
+
+    // Mirror the engine arrow onto chess.com's real board.
+    syncBoardArrow();
   }
 
   function renderSummaryList() {
@@ -837,7 +962,7 @@
 
     document.body.appendChild(panel);
 
-    panel.querySelector('.ca-close').addEventListener('click', () => panel.remove());
+    panel.querySelector('.ca-close').addEventListener('click', () => { panel.remove(); clearBoardArrow(); });
     panel.querySelector('#ca-analyze-btn').addEventListener('click', startAnalysis);
     panel.querySelector('#ca-log-copy').addEventListener('click', async () => {
       const logEl = document.getElementById('ca-log');
@@ -927,7 +1052,7 @@
       if (dockBtn) dockBtn.textContent = '⊞ Float';
       if (header) header.style.cursor = 'default';
     } else {
-      const w = state.width  ?? 360;
+      const w = state.width  ?? 300;
       const h = state.height ?? 600;
       panel.style.right  = 'auto';
       panel.style.width  = w + 'px';
@@ -1034,7 +1159,7 @@
 
   function togglePanel() {
     const existing = document.getElementById('chess-analyzer-panel');
-    if (existing) { existing.remove(); stopShareProbe(); return; }
+    if (existing) { existing.remove(); stopShareProbe(); clearBoardArrow(); return; }
     injectPanel();
     startShareProbe();
   }

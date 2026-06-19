@@ -4,9 +4,9 @@
   position: fixed;
   top: 0;
   right: 0;
-  width: 380px;
+  width: 320px;
   height: 100vh;
-  min-width: 280px;
+  min-width: 260px;
   min-height: 300px;
   background: #1a1a2e;
   color: #e8e8e8;
@@ -305,46 +305,6 @@
   font-size: 12px;
   color: #9aa3c0;
   font-variant-numeric: tabular-nums;
-}
-
-/* Mini board */
-.ca-mb {
-  position: relative;
-  align-self: center;
-  border-radius: 4px;
-  overflow: hidden;
-  box-shadow: 0 0 0 1px #2a2a4a;
-}
-.ca-mb-board {
-  display: grid;
-}
-.ca-mb-sq {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  /* font-size is set inline (proportional to square size) in renderMiniBoard */
-  line-height: 1;
-  user-select: none;
-}
-.ca-mb-sq.l { background: #ecd9b0; }
-.ca-mb-sq.d { background: #b58863; }
-/* Crisp, high-contrast pieces: a real outline stroke around each glyph reads
-   far better at small sizes than a soft drop-shadow. White = light fill + dark
-   stroke, black = dark fill + light stroke, so both pop on either square. */
-.ca-mb-sq.pw {
-  color: #ffffff;
-  -webkit-text-stroke: 1.4px #16161e;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
-}
-.ca-mb-sq.pb {
-  color: #141420;
-  -webkit-text-stroke: 1.2px rgba(255, 255, 255, 0.65);
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
-}
-.ca-mb-arrows {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
 }
 
 /* Top engine lines */
