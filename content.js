@@ -6,6 +6,7 @@
   // ── State ──────────────────────────────────────────────────────────────────
   let sfReady       = false;
   let analyzedMoves = [];
+  let isAnalyzing = false;
   let currentHalfMove = -1;
   let currentArrowIdx = -1; // -1 = played move, 0..2 = engine top moves
 
@@ -369,16 +370,18 @@
     const btn     = document.getElementById('ca-analyze-btn');
     const statusEl = document.getElementById('ca-status');
     const viewEl  = document.getElementById('ca-view');
-    const summaryEl = document.getElementById('ca-summary');
 
     btn.disabled = true;
     btn.textContent = 'Analyzing…';
     viewEl.innerHTML = '';
-    summaryEl.innerHTML = '';
     logClear();
 
+    // Pause board/eval syncing while analyzing so the main thread isn't doing
+    // DOM work that competes with handling engine results.
+    isAnalyzing = true;
+
     // Restore the button on any exit path (error or completion).
-    const finish = () => { btn.disabled = false; btn.textContent = 'Analyze Game'; };
+    const finish = () => { btn.disabled = false; btn.textContent = 'Analyze Game'; isAnalyzing = false; };
 
     // 1. Load PGN
     renderProgress({ phase: 'Reading game…' });
@@ -523,40 +526,43 @@
 
     currentHalfMove = getCurrentHalfMoveFromURL();
     currentArrowIdx = -1;
-    renderProgress(null);     // cleared visually by renderCurrentMove below
+    renderProgress(null);     // remove the loading overlay
     renderCurrentMove();
-    renderSummaryList();
     finish();
   }
 
-  // Render (or clear) the in-progress analysis card in the main view area.
+  // Render (or clear) the full-screen analysis loading overlay.
   // Pass null to clear. `state` = { phase, current?, total?, label? }.
   function renderProgress(state) {
-    const el = document.getElementById('ca-view');
-    if (!el) return;
-    if (!state) { el.innerHTML = ''; return; }
+    let ov = document.getElementById('ca-loading');
+    if (!state) { ov?.remove(); return; }
+    if (!ov) {
+      ov = document.createElement('div');
+      ov.id = 'ca-loading';
+      document.body.appendChild(ov);
+    }
 
     const { phase, current, total, label } = state;
     const determinate = Number.isFinite(current) && Number.isFinite(total) && total > 0;
-    const done = determinate ? current : 0;
-    const pct  = determinate ? Math.round((done / total) * 100) : 0;
+    const pct = determinate ? Math.round((current / total) * 100) : 0;
 
-    const counter = determinate ? `<span class="ca-prog-count">${done} / ${total}</span>` : '';
-    const sub     = determinate && label
-      ? `<div class="ca-prog-sub">Move ${label}</div>`
-      : '';
-    const bar = determinate
-      ? `<div class="ca-prog-bar"><div class="ca-prog-fill" style="width:${pct}%"></div></div>`
-      : `<div class="ca-prog-bar ca-prog-indeterminate"><div class="ca-prog-fill"></div></div>`;
+    // Big percentage ring when we can count progress; spinner otherwise.
+    const head = determinate
+      ? `<div class="ca-load-pct">${pct}<span class="ca-load-pct-sign">%</span></div>`
+      : `<div class="ca-load-spinner"></div>`;
+    const counter = determinate ? `<div class="ca-load-count">Move ${current} of ${total}</div>` : '';
+    const sub = determinate && label ? `<div class="ca-load-move">${label}</div>` : '';
+    const bar = `<div class="ca-load-bar ${determinate ? '' : 'ca-load-indeterminate'}">
+        <div class="ca-load-fill" style="${determinate ? `width:${pct}%` : ''}"></div>
+      </div>`;
 
-    el.innerHTML = `
-      <div class="ca-progress">
-        <div class="ca-prog-top">
-          <span class="ca-prog-spinner"></span>
-          <span class="ca-prog-phase">${phase}</span>
-          ${counter}
-        </div>
+    ov.innerHTML = `
+      <div class="ca-load-card">
+        <div class="ca-load-title">♞ Analyzing game</div>
+        ${head}
+        <div class="ca-load-phase">${phase}</div>
         ${bar}
+        ${counter}
         ${sub}
       </div>`;
   }
@@ -609,7 +615,7 @@
       // Re-sync the board arrow every tick: chess.com re-renders its board on
       // navigation/animation (which can drop our overlay), and the placement
       // match keeps the arrow aligned with whatever position is shown.
-      if (analyzedMoves.length > 0) syncBoardArrow();
+      if (analyzedMoves.length > 0 && !isAnalyzing) syncBoardArrow();
     }, 200);
   }
 
@@ -733,6 +739,87 @@
     svg.innerHTML = arrowSvg + badgeSvg;
   }
 
+  // ── Evaluation bar (chess.com-style, left of the board) ─────────────────────
+  // A fixed vertical bar whose white portion reflects White's win probability
+  // for the position currently shown. Driven by the same per-position evals
+  // Stockfish already produced during analysis.
+
+  const CA_EVAL_BAR_ID = 'ca-eval-bar';
+
+  function clearEvalBar() {
+    document.getElementById(CA_EVAL_BAR_ID)?.remove();
+  }
+
+  function ensureEvalBar() {
+    let bar = document.getElementById(CA_EVAL_BAR_ID);
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = CA_EVAL_BAR_ID;
+      bar.style.cssText = 'position:fixed;width:18px;background:#403e3b;border-radius:4px 0 0 4px;' +
+        'overflow:hidden;z-index:9999;box-shadow:0 0 0 1px rgba(0,0,0,0.35);';
+      bar.innerHTML = '<div class="ca-eval-fill"></div><div class="ca-eval-num"></div>';
+      document.body.appendChild(bar);
+    }
+    return bar;
+  }
+
+  // Position the bar against the board (call every tick / on scroll) and, when
+  // the shown position is known (idx >= 0), update its fill and number.
+  function syncEvalBar(boardEl, idx) {
+    const rect = boardEl.getBoundingClientRect();
+    if (!rect.width) { clearEvalBar(); return; }
+
+    let bar = document.getElementById(CA_EVAL_BAR_ID);
+    if (idx >= 0) {
+      const move = analyzedMoves[idx];
+      const line = move?.engineData?.topMoves?.[0];
+      const side = (move?.fen.split(' ')[1] === 'b') ? 'b' : 'w';
+      bar = ensureEvalBar();
+      setEvalBarValue(bar, line, side, boardIsFlipped(boardEl));
+    }
+    if (!bar) return;                          // nothing to show yet
+
+    // Sit flush against the board's left edge, like chess.com.
+    const W = 18;
+    bar.style.top    = rect.top + 'px';
+    bar.style.left   = Math.max(0, rect.left - W) + 'px';
+    bar.style.height = rect.height + 'px';
+  }
+
+  // Eval → bar fill %, from White's perspective. This is intentionally steeper
+  // than the win-probability curve used for classification: chess.com's eval bar
+  // commits to an advantage harder than a calibrated win% does. Tune STEEP to
+  // taste — higher = the bar reacts more, lower = less.
+  const EVAL_BAR_STEEP = 0.25;                 // per pawn
+  function evalToBarPct(line, sign) {
+    if (!line) return 50;
+    if (line.isMate) return (line.mateIn ?? 0) * sign > 0 ? 100 : 0;
+    const cp = clamp((line.score ?? 0) * sign, -12, 12);  // pawns, clamped
+    return 50 + 50 * Math.tanh(EVAL_BAR_STEEP * cp);
+  }
+
+  // Compute White's bar fill + label from a line and paint the bar.
+  function setEvalBarValue(bar, line, sideToMove, flipped) {
+    const sign = sideToMove === 'w' ? 1 : -1;
+    const pct = evalToBarPct(line, sign);
+    let text;
+    if (line?.isMate)   text = 'M' + Math.abs(line.mateIn ?? 0);
+    else if (line)      text = (((line.score ?? 0) * sign) >= 0 ? '+' : '') + ((line.score ?? 0) * sign).toFixed(1);
+    else                text = '0.0';
+
+    const fill = bar.querySelector('.ca-eval-fill');
+    // White fills from White's side: bottom normally, top when the board is flipped.
+    fill.style.cssText = 'position:absolute;left:0;right:0;background:#f0f0f0;' +
+      'transition:height 0.25s ease;height:' + pct + '%;' + (flipped ? 'top:0;' : 'bottom:0;');
+
+    const num = bar.querySelector('.ca-eval-num');
+    num.textContent = text;
+    num.style.cssText = 'position:absolute;left:0;right:0;text-align:center;' +
+      'font:700 9px -apple-system,BlinkMacSystemFont,sans-serif;' +
+      (flipped ? 'top:1px;' : 'bottom:1px;') +
+      'color:' + (pct > 7 ? '#111' : '#fff') + ';';
+  }
+
   // Destination square + classification of a played move (for the badge).
   function playedMoveBadge(move) {
     if (!move) return null;
@@ -744,9 +831,9 @@
   // Render the arrow + quality badge for whatever position chess.com is showing.
   function syncBoardArrow() {
     const boardEl = findChessBoard();
-    if (!boardEl || !analyzedMoves.length) { clearBoardArrow(); return; }
+    if (!boardEl || !analyzedMoves.length) { clearBoardArrow(); clearEvalBar(); return; }
     const placement = readBoardPlacement(boardEl);
-    if (!placement) { clearBoardArrow(); return; }
+    if (!placement) { clearBoardArrow(); clearEvalBar(); return; }
 
     // Match the on-screen pieces to an analyzed (pre-move) position. Test the
     // likely plies first (chess.com may show the pre- or post-move position),
@@ -760,6 +847,9 @@
         if (fenPlacement(analyzedMoves[i].fen) === placement) { idx = i; break; }
       }
     }
+
+    // Keep the evaluation bar in sync with the displayed position.
+    syncEvalBar(boardEl, idx);
 
     // Identify the move that was actually PLAYED to reach the displayed position.
     // The board shows the position after that move, so the badge and the
@@ -859,62 +949,8 @@
       });
     });
 
-    // Sync active row in All Moves
-    document.querySelectorAll('.ca-move-cell').forEach((c) => c.classList.remove('ca-cell-active'));
-    const activeCell = document.querySelector(`.ca-move-cell[data-half="${currentHalfMove}"]`);
-    if (activeCell) {
-      activeCell.classList.add('ca-cell-active');
-      activeCell.scrollIntoView({ block: 'nearest' });
-    }
-
     // Mirror the engine arrow onto chess.com's real board.
     syncBoardArrow();
-  }
-
-  function renderSummaryList() {
-    const el = document.getElementById('ca-summary');
-    if (!el) return;
-    el.innerHTML = '<div class="ca-summary-title">All moves</div>';
-
-    const grid = document.createElement('div');
-    grid.className = 'ca-moves-grid';
-
-    // Group by move number; pair white + black
-    const byMoveNum = new Map();
-    analyzedMoves.forEach((m, i) => {
-      const e = byMoveNum.get(m.moveNumber) || { num: m.moveNumber };
-      if (m.color === 'White') e.white = { ...m, half: i };
-      else                     e.black = { ...m, half: i };
-      byMoveNum.set(m.moveNumber, e);
-    });
-
-    for (const row of byMoveNum.values()) {
-      const r = document.createElement('div');
-      r.className = 'ca-move-row';
-      r.innerHTML = `
-        <span class="ca-move-num">${row.num}.</span>
-        ${cellHtml(row.white)}
-        ${cellHtml(row.black)}`;
-      grid.appendChild(r);
-    }
-    el.appendChild(grid);
-
-    grid.querySelectorAll('.ca-move-cell').forEach((c) => {
-      c.addEventListener('click', () => {
-        currentHalfMove = parseInt(c.dataset.half);
-        currentArrowIdx = -1;
-        renderCurrentMove();
-      });
-    });
-  }
-
-  function cellHtml(m) {
-    if (!m) return `<span class="ca-move-cell ca-cell-empty"></span>`;
-    const color = CLASS_COLORS[m.classification] ?? '#888';
-    return `<button class="ca-move-cell" data-half="${m.half}">
-      <span class="ca-cell-san">${m.played}</span>
-      <span class="ca-cell-dot" style="background:${color}" title="${CLASS_LABELS[m.classification]}"></span>
-    </button>`;
   }
 
   // ── Panel HTML ─────────────────────────────────────────────────────────────
@@ -956,13 +992,12 @@
           </div>
           <div class="ca-log" id="ca-log"></div>
         </div>
-        <div class="ca-summary" id="ca-summary"></div>
-        <div class="ca-kb-hint">← → navigate moves · click any move below</div>
+        <div class="ca-kb-hint">← → navigate moves</div>
       </div>`;
 
     document.body.appendChild(panel);
 
-    panel.querySelector('.ca-close').addEventListener('click', () => { panel.remove(); clearBoardArrow(); });
+    panel.querySelector('.ca-close').addEventListener('click', () => { panel.remove(); clearBoardArrow(); clearEvalBar(); });
     panel.querySelector('#ca-analyze-btn').addEventListener('click', startAnalysis);
     panel.querySelector('#ca-log-copy').addEventListener('click', async () => {
       const logEl = document.getElementById('ca-log');
@@ -1002,6 +1037,15 @@
       }
       savePanelState(panel);
     });
+
+    // Keep the board overlay + eval bar glued to the board as the page scrolls
+    // or resizes. Registered once; cheap no-op until a game is analyzed.
+    if (!window.__caBoardSync) {
+      window.__caBoardSync = true;
+      const resync = () => { if (analyzedMoves.length && !isAnalyzing) syncBoardArrow(); };
+      window.addEventListener('scroll', resync, true);
+      window.addEventListener('resize', resync);
+    }
 
     // Restore the last-used position/size/dock state before wiring interactions.
     applyPanelState(panel, loadPanelState());
@@ -1159,7 +1203,7 @@
 
   function togglePanel() {
     const existing = document.getElementById('chess-analyzer-panel');
-    if (existing) { existing.remove(); stopShareProbe(); clearBoardArrow(); return; }
+    if (existing) { existing.remove(); stopShareProbe(); clearBoardArrow(); clearEvalBar(); return; }
     injectPanel();
     startShareProbe();
   }
