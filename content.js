@@ -10,6 +10,20 @@
   let currentHalfMove = -1;
   let currentArrowIdx = -1; // -1 = played move, 0..2 = engine top moves
 
+  // Each analysis run gets a monotonic id. Aborting bumps the id, which the
+  // in-flight loop checks after every await so it unwinds instead of running
+  // on against a UI that's already been torn down.
+  let analysisRunId = 0;
+
+  // Stall watchdog: we stamp the time of the last forward progress and a 1 s
+  // interval checks whether the engine has gone quiet (the "is it really
+  // loading?" check). Tunables below.
+  let lastProgressAt = 0;
+  let stallWatchdog  = null;
+  let lastProgressState = null;          // last state handed to renderProgress
+  const STALL_WARN_MS = 18000;           // engine quiet this long → warn in overlay
+  const MOVE_TIMEOUT_MS = 30000;         // hard per-position engine timeout
+
   // ── SAN / move helpers ────────────────────────────────────────────────────
 
   // Convert a UCI move (e.g. "e2e4", "e7e8q") to SAN ("e4", "e8=Q") given the
@@ -59,8 +73,18 @@
   // The engine lives in an offscreen document at the extension origin (see
   // background.js / offscreen.js). We talk to it by message, not by Worker.
 
-  const pendingAnalysis = new Map(); // id → resolve fn
+  const pendingAnalysis = new Map(); // id → { resolve, reject }
   let nextAnalysisId = 1;
+
+  // Reject every in-flight position request. Used on abort so the loop's
+  // pending `await analyzePosition(...)` throws immediately instead of sitting
+  // on its 30 s timeout.
+  function rejectAllPending(reason) {
+    for (const [, entry] of pendingAnalysis) {
+      try { entry.reject(new Error(reason || 'cancelled')); } catch { /* noop */ }
+    }
+    pendingAnalysis.clear();
+  }
 
   function initStockfish() {
     return new Promise((resolve, reject) => {
@@ -79,11 +103,20 @@
       const id = nextAnalysisId++;
       const timeout = setTimeout(() => {
         pendingAnalysis.delete(id);
-        reject(new Error('Engine timeout for FEN: ' + fen));
-      }, 30000);
-      pendingAnalysis.set(id, (result) => { clearTimeout(timeout); resolve(result); });
+        reject(new Error('Engine timed out (no reply in ' + Math.round(MOVE_TIMEOUT_MS / 1000) + 's)'));
+      }, MOVE_TIMEOUT_MS);
+      pendingAnalysis.set(id, {
+        resolve: (result) => { clearTimeout(timeout); resolve(result); },
+        reject:  (err)    => { clearTimeout(timeout); reject(err); },
+      });
       chrome.runtime.sendMessage({ type: 'ANALYZE_POSITION', id, fen, depth, multiPV });
     });
+  }
+
+  // Ask the offscreen engine to abandon the current search and reset, so an
+  // aborted run doesn't leave Stockfish mid-search and break the next one.
+  function stopEngine() {
+    try { chrome.runtime.sendMessage({ type: 'STOP_ENGINE' }); } catch { /* noop */ }
   }
 
   // ── PGN extraction ─────────────────────────────────────────────────────────
@@ -253,10 +286,86 @@
     const pgn = await extractPGNViaShareButton();
     if (pgn) { log('PGN captured ✓', 'ok'); return pgn; }
 
+    // Automation failed. The paste fallback lives inside the panel, which the
+    // full-screen loading overlay sits on top of — drop the overlay first so
+    // the textarea is actually reachable (otherwise: an unstoppable spinner).
     log('Automation failed — paste PGN manually below', 'warn');
+    renderProgress(null);
     const pasted = await waitForManualPaste();
     if (pasted) log('PGN pasted ✓', 'ok');
     return pasted;
+  }
+
+  // ── PGN validation ───────────────────────────────────────────────────────
+  // Confirm a PGN is real and replayable *before* we commit to the whole
+  // loading flow, and build the per-ply positions. Honors a custom starting
+  // position ([FEN]/[SetUp] headers, common on analysis-board / imported
+  // games) — replaying those from the default start used to silently desync.
+  // Returns { ok:true, positions } or { ok:false, reason }.
+  function validateAndBuildPositions(pgn) {
+    const text = (pgn || '').trim();
+    if (!text) return { ok: false, reason: 'the PGN was empty' };
+
+    let chess;
+    try {
+      chess = new Chess();
+    } catch (e) {
+      return { ok: false, reason: 'chess parser failed to initialize (' + e.message + ')' };
+    }
+
+    let loaded = false;
+    try {
+      loaded = chess.load_pgn(text, { sloppy: true });
+    } catch (e) {
+      return { ok: false, reason: 'the PGN could not be parsed (' + e.message + ')' };
+    }
+    if (!loaded) {
+      return { ok: false, reason: "this doesn't look like a valid PGN (use chess.com's Share → PGN, which gives the right format)" };
+    }
+
+    let history;
+    try {
+      history = chess.history({ verbose: true });
+    } catch (e) {
+      return { ok: false, reason: 'could not read the move list (' + e.message + ')' };
+    }
+    if (!history.length) {
+      return { ok: false, reason: 'the game has no moves to analyze' };
+    }
+
+    // Respect a custom starting position if the PGN declares one.
+    let startFen = null;
+    try { const h = chess.header(); startFen = h.FEN || h.fen || null; } catch { /* no headers */ }
+    if (startFen) {
+      const ver = new Chess().validate_fen(startFen);
+      if (!ver || !ver.valid) {
+        return { ok: false, reason: "the game's starting position (FEN header) is invalid" };
+      }
+    }
+
+    let replay;
+    try { replay = startFen ? new Chess(startFen) : new Chess(); }
+    catch (e) { return { ok: false, reason: "could not set up the game's starting position (" + e.message + ')' }; }
+
+    const positions = [];
+    for (let i = 0; i < history.length; i++) {
+      const move = history[i];
+      const fen  = replay.fen();
+      const applied = replay.move(move);     // object form → matches from/to/promotion
+      if (!applied) {
+        return {
+          ok: false,
+          reason: `move ${Math.floor(i / 2) + 1} (${move.san}) didn't apply cleanly — the PGN may contain variations or be corrupt`,
+        };
+      }
+      positions.push({
+        fen,
+        san: move.san,
+        moveNumber: Math.floor(i / 2) + 1,
+        color: move.color === 'w' ? 'White' : 'Black',
+      });
+    }
+    return { ok: true, positions };
   }
 
   // ── Analyze-button gating ──────────────────────────────────────────────────
@@ -366,95 +475,149 @@
 
   // ── Analysis flow ──────────────────────────────────────────────────────────
 
-  async function startAnalysis() {
-    const btn     = document.getElementById('ca-analyze-btn');
-    const statusEl = document.getElementById('ca-status');
-    const viewEl  = document.getElementById('ca-view');
+  // Tear down an in-flight analysis. Bumping analysisRunId makes the running
+  // loop bail at its next checkpoint; rejecting pending requests unblocks any
+  // `await analyzePosition(...)` immediately; we also tell the engine to drop
+  // its current search so the next run starts clean.
+  function abortAnalysis(message, type = 'warn') {
+    if (!isAnalyzing) return;
+    analysisRunId++;
+    rejectAllPending(message || 'Analysis aborted');
+    stopEngine();
+    stopStallWatchdog();
+    if (message) log(message, type);
+    renderProgress(null);
+    const btn = document.getElementById('ca-analyze-btn');
+    if (btn) { btn.disabled = false; btn.textContent = 'Analyze Game'; }
+    isAnalyzing = false;
+  }
 
-    btn.disabled = true;
-    btn.textContent = 'Analyzing…';
-    viewEl.innerHTML = '';
+  function noteProgress() { lastProgressAt = Date.now(); }
+
+  // The "is it really loading?" checker. While the engine phase is running, a
+  // 1 s tick watches for it going quiet. If nothing has progressed for
+  // STALL_WARN_MS we flip the overlay into a warning state (with the Stop
+  // button) so a stuck engine can't masquerade as normal slow progress. A dead
+  // engine is still hard-failed by analyzePosition's per-move timeout.
+  function startStallWatchdog() {
+    stopStallWatchdog();
+    noteProgress();
+    stallWatchdog = setInterval(() => {
+      if (!isAnalyzing) return;
+      const quiet = Date.now() - lastProgressAt;
+      if (quiet >= STALL_WARN_MS && lastProgressState) {
+        renderProgress({ ...lastProgressState, stalled: Math.round(quiet / 1000) });
+      }
+    }, 1000);
+  }
+  function stopStallWatchdog() {
+    if (stallWatchdog) { clearInterval(stallWatchdog); stallWatchdog = null; }
+  }
+
+  async function startAnalysis() {
+    if (isAnalyzing) return;                 // guard against double-start
+    const btn      = document.getElementById('ca-analyze-btn');
+    const statusEl = document.getElementById('ca-status');
+    const viewEl   = document.getElementById('ca-view');
+
+    if (btn) { btn.disabled = true; btn.textContent = 'Analyzing…'; }
+    if (viewEl) viewEl.innerHTML = '';
     logClear();
 
     // Pause board/eval syncing while analyzing so the main thread isn't doing
     // DOM work that competes with handling engine results.
     isAnalyzing = true;
+    const myRunId = ++analysisRunId;
+    const cancelled = () => myRunId !== analysisRunId;   // a newer run / abort owns the UI
+    const onStop = () => abortAnalysis('Analysis stopped.', 'warn');
 
-    // Restore the button on any exit path (error or completion).
-    const finish = () => { btn.disabled = false; btn.textContent = 'Analyze Game'; isAnalyzing = false; };
+    // Restore the button on the normal exit paths. No-ops if a newer run (or an
+    // abort) has already taken over, so it never fights abortAnalysis.
+    const finish = () => {
+      if (cancelled()) return;
+      if (btn) { btn.disabled = false; btn.textContent = 'Analyze Game'; }
+      isAnalyzing = false;
+    };
 
-    // 1. Load PGN
-    renderProgress({ phase: 'Reading game…' });
-    const pgn = await getPGN();
-    if (!pgn) {
-      log('Could not read game — make sure it is finished and you are on /game/live/... or /game/daily/...', 'error');
-      renderProgress(null);
-      finish();
-      return;
-    }
-
-    // 2. Parse PGN → positions
-    let positions;
     try {
-      const chess   = new Chess();
-      const loaded  = chess.load_pgn(pgn);
-      if (!loaded) throw new Error('load_pgn returned false');
-      const history = chess.history({ verbose: true });
-      const replay  = new Chess();
-      positions = history.map((move, i) => {
-        const fen = replay.fen();
-        replay.move(move);
-        return { fen, san: move.san, moveNumber: Math.floor(i / 2) + 1, color: move.color === 'w' ? 'White' : 'Black' };
-      });
-    } catch (e) {
-      log('PGN parse error: ' + e.message, 'error');
-      renderProgress(null);
-      finish();
-      return;
-    }
-
-    log(`Game loaded — ${positions.length} moves to analyze`, 'ok');
-
-    // 3. Init Stockfish
-    if (!sfReady) {
-      renderProgress({ phase: 'Starting Stockfish engine…' });
-      log('Starting Stockfish engine...', 'info');
-      try {
-        await initStockfish();
-        log('Stockfish ready ✓', 'ok');
-      } catch (e) {
-        log('Stockfish failed to start: ' + e.message, 'error');
+      // 1. Load PGN
+      renderProgress({ phase: 'Reading game…', onStop });
+      const pgn = await getPGN();
+      if (cancelled()) return;
+      if (!pgn) {
+        log('Could not read game — open a finished game, or paste its PGN (Share → PGN).', 'error');
         renderProgress(null);
-        finish();
         return;
       }
-    } else {
-      log('Stockfish already running ✓', 'ok');
+
+      // 2. Validate + build positions (also catches custom-start / corrupt PGNs)
+      renderProgress({ phase: 'Checking game…', onStop });
+      const parsed = validateAndBuildPositions(pgn);
+      if (!parsed.ok) {
+        log('Cannot analyze this game: ' + parsed.reason + '.', 'error');
+        renderProgress(null);
+        return;
+      }
+      const positions = parsed.positions;
+      log(`Game loaded — ${positions.length} moves to analyze`, 'ok');
+
+      // 3. Init Stockfish
+      if (!sfReady) {
+        renderProgress({ phase: 'Starting Stockfish engine…', onStop });
+        log('Starting Stockfish engine...', 'info');
+        await initStockfish();
+        if (cancelled()) return;
+        log('Stockfish ready ✓', 'ok');
+      } else {
+        log('Stockfish already running ✓', 'ok');
+      }
+
+      // 4. Analyze each position
+      startStallWatchdog();
+      const results = [];
+      for (let i = 0; i < positions.length; i++) {
+        if (cancelled()) return;
+        const { fen, san, moveNumber, color } = positions[i];
+        renderProgress({ phase: 'Analyzing moves', current: i, total: positions.length,
+                         label: `${moveNumber}${color === 'Black' ? '…' : '.'} ${san}`, onStop });
+        log(`[${i + 1}/${positions.length}] Stockfish analyzing move ${moveNumber}. ${color}: ${san}...`, 'engine');
+
+        const engineData = await analyzePosition(fen, 12, 3);
+        if (cancelled()) return;
+        noteProgress();                       // forward progress → reset stall timer
+        if (!engineData || !Array.isArray(engineData.topMoves)) {
+          throw new Error(`engine returned no result for move ${moveNumber}`);
+        }
+        const bestMove = engineData.bestMove;
+
+        const topStr = engineData.topMoves.map((m, j) =>
+          `#${j+1} ${m.uci} (${m.score > 0 ? '+' : ''}${m.score.toFixed(2)})`
+        ).join(' | ');
+
+        log(
+          `→ Best: <strong>${bestMove}</strong> | Top moves: ${topStr}`,
+          'result'
+        );
+
+        results.push({ index: i, moveNumber, color, played: san, fen, engineData, bestMove });
+      }
+      stopStallWatchdog();
+
+      analyzeResults(results, statusEl);
+    } catch (e) {
+      if (cancelled()) return;                // an abort already cleaned up + logged
+      log('Analysis failed: ' + e.message, 'error');
+      stopEngine();                           // a timed-out search may still be running
+      renderProgress(null);
+    } finally {
+      stopStallWatchdog();
+      finish();
     }
+  }
 
-    // 4. Analyze each position
-    const results = [];
-    for (let i = 0; i < positions.length; i++) {
-      const { fen, san, moveNumber, color } = positions[i];
-      renderProgress({ phase: 'Analyzing moves', current: i, total: positions.length,
-                       label: `${moveNumber}${color === 'Black' ? '…' : '.'} ${san}` });
-      log(`[${i + 1}/${positions.length}] Stockfish analyzing move ${moveNumber}. ${color}: ${san}...`, 'engine');
-
-      const engineData = await analyzePosition(fen, 12, 3);
-      const bestMove   = engineData.bestMove;
-
-      const topStr = engineData.topMoves.map((m, j) =>
-        `#${j+1} ${m.uci} (${m.score > 0 ? '+' : ''}${m.score.toFixed(2)})`
-      ).join(' | ');
-
-      log(
-        `→ Best: <strong>${bestMove}</strong> | Top moves: ${topStr}`,
-        'result'
-      );
-
-      results.push({ index: i, moveNumber, color, played: san, fen, engineData, bestMove });
-    }
-
+  // Classification + summary + first render. Split out of startAnalysis so the
+  // analyze flow above reads as a linear pipeline.
+  function analyzeResults(results, statusEl) {
     // Second pass: classify each move by its win-probability loss. We compare
     // the win% of the engine's best line at this position against the win% the
     // player actually achieved (read from the *next* position's best line,
@@ -522,27 +685,30 @@
       if (p) log(`${side}: ${p.accuracy.toFixed(1)}% accuracy · ≈${p.elo} Elo`, 'summary');
     }
 
-    statusEl.innerHTML = renderAccuracyHtml(perPlayer) + renderStatsHtml(counts);
+    if (statusEl) statusEl.innerHTML = renderAccuracyHtml(perPlayer) + renderStatsHtml(counts);
 
     currentHalfMove = getCurrentHalfMoveFromURL();
     currentArrowIdx = -1;
     renderProgress(null);     // remove the loading overlay
+    renderEvalGraph();
     renderCurrentMove();
-    finish();
   }
 
   // Render (or clear) the full-screen analysis loading overlay.
-  // Pass null to clear. `state` = { phase, current?, total?, label? }.
+  // Pass null to clear. `state` = { phase, current?, total?, label?, stalled?, onStop? }.
+  //   onStop  → render a Stop button wired to that handler (manual abort).
+  //   stalled → seconds the engine has been quiet; flips the card to a warning.
   function renderProgress(state) {
     let ov = document.getElementById('ca-loading');
-    if (!state) { ov?.remove(); return; }
+    if (!state) { ov?.remove(); lastProgressState = null; return; }
+    lastProgressState = state;
     if (!ov) {
       ov = document.createElement('div');
       ov.id = 'ca-loading';
       document.body.appendChild(ov);
     }
 
-    const { phase, current, total, label } = state;
+    const { phase, current, total, label, stalled, onStop } = state;
     const determinate = Number.isFinite(current) && Number.isFinite(total) && total > 0;
     const pct = determinate ? Math.round((current / total) * 100) : 0;
 
@@ -555,16 +721,26 @@
     const bar = `<div class="ca-load-bar ${determinate ? '' : 'ca-load-indeterminate'}">
         <div class="ca-load-fill" style="${determinate ? `width:${pct}%` : ''}"></div>
       </div>`;
+    const warn = stalled
+      ? `<div class="ca-load-warn">⚠ The engine has been quiet for ${stalled}s — it may be stuck. Stop and try again if it doesn't move.</div>`
+      : '';
+    const stop = onStop ? `<button class="ca-load-stop" id="ca-load-stop" type="button">Stop</button>` : '';
 
     ov.innerHTML = `
-      <div class="ca-load-card">
+      <div class="ca-load-card${stalled ? ' ca-load-card-warn' : ''}">
         <div class="ca-load-title">♞ Analyzing game</div>
         ${head}
         <div class="ca-load-phase">${phase}</div>
         ${bar}
         ${counter}
         ${sub}
+        ${warn}
+        ${stop}
       </div>`;
+
+    // Wire the Stop button programmatically — chess.com's CSP blocks inline
+    // event handlers, so an onclick="" attribute would silently do nothing.
+    if (onStop) ov.querySelector('#ca-load-stop')?.addEventListener('click', onStop);
   }
 
   function renderAccuracyHtml(perPlayer) {
@@ -610,6 +786,7 @@
         if (hm !== currentHalfMove && analyzedMoves.length > 0) {
           currentHalfMove = hm;
           renderCurrentMove();
+          updateGraphMarker();
         }
       }
       // Re-sync the board arrow every tick: chess.com re-renders its board on
@@ -820,6 +997,96 @@
       'color:' + (pct > 7 ? '#111' : '#fff') + ';';
   }
 
+  // ── Evaluation graph ───────────────────────────────────────────────────────
+  // A game-review-style area chart of the whole game's evaluation, from White's
+  // perspective. White's advantage fills upward (more light area); Black's pulls
+  // the curve down into the dark. An orange marker tracks the shown move, and
+  // clicking the graph jumps there.
+
+  const CA_GRAPH_W = 100;            // SVG viewBox units (scaled to the container)
+  const CA_GRAPH_H = 48;
+  const CA_GRAPH_MARKER_ID = 'ca-graph-marker';
+
+  // White-perspective bar % (0–100) for the position before a given move,
+  // reusing the eval-bar curve so the graph and bar agree.
+  function whitePctForMove(move) {
+    if (!move) return 50;
+    const line = move.engineData?.topMoves?.[0];
+    const sign = (move.fen?.split(' ')[1] === 'b') ? -1 : 1;
+    return evalToBarPct(line, sign);
+  }
+
+  function graphX(i, n) { return n <= 1 ? CA_GRAPH_W / 2 : (i / (n - 1)) * CA_GRAPH_W; }
+  function graphY(pct)  { return CA_GRAPH_H * (1 - pct / 100); }
+
+  function renderEvalGraph() {
+    const el = document.getElementById('ca-graph');
+    if (!el) return;
+    const n = analyzedMoves.length;
+    if (!n) { el.innerHTML = ''; el.style.display = 'none'; return; }
+    el.style.display = 'block';
+
+    const W = CA_GRAPH_W, H = CA_GRAPH_H;
+    const pt = (i) => `${graphX(i, n).toFixed(2)},${graphY(whitePctForMove(analyzedMoves[i])).toFixed(2)}`;
+    const curve = analyzedMoves.map((_, i) => pt(i)).join(' ');
+    const area  = `0,${H} ${curve} ${W},${H}`;     // White's territory = below the curve
+
+    // Quality dots for notable moves.
+    const dots = analyzedMoves.map((m, i) => {
+      if (!['inaccuracy', 'mistake', 'blunder'].includes(m.classification)) return '';
+      const [cx, cy] = pt(i).split(',');
+      return `<circle cx="${cx}" cy="${cy}" r="1.7" fill="${CLASS_COLORS[m.classification]}" stroke="#0a0f1e" stroke-width="0.4"/>`;
+    }).join('');
+
+    el.innerHTML = `
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="ca-graph-svg">
+        <rect x="0" y="0" width="${W}" height="${H}" fill="#26233f"/>
+        <polygon points="${area}" fill="#e6e6ee"/>
+        <line x1="0" y1="${H / 2}" x2="${W}" y2="${H / 2}" stroke="#000" stroke-opacity="0.35" stroke-width="0.3" stroke-dasharray="1.5 1.5"/>
+        <polyline points="${curve}" fill="none" stroke="#8a90b8" stroke-width="0.5"/>
+        ${dots}
+        <line id="${CA_GRAPH_MARKER_ID}" x1="0" y1="0" x2="0" y2="${H}" stroke="#e2b96f" stroke-width="0.8"/>
+      </svg>`;
+
+    const svg = el.querySelector('svg');
+    svg.addEventListener('click', (e) => {
+      const r = svg.getBoundingClientRect();
+      if (!r.width) return;
+      const frac = clamp((e.clientX - r.left) / r.width, 0, 1);
+      navigateToHalfMove(Math.round(frac * (n - 1)));
+    });
+
+    updateGraphMarker();
+  }
+
+  // Move the marker to the current ply without rebuilding the graph.
+  function updateGraphMarker() {
+    const marker = document.getElementById(CA_GRAPH_MARKER_ID);
+    if (!marker) return;
+    const n = analyzedMoves.length;
+    if (!n || currentHalfMove < 0) { marker.style.display = 'none'; return; }
+    marker.style.display = '';
+    const x = graphX(clamp(currentHalfMove, 0, n - 1), n).toFixed(2);
+    marker.setAttribute('x1', x);
+    marker.setAttribute('x2', x);
+  }
+
+  // Step chess.com's board to a target ply by replaying the same arrow-key path
+  // manual navigation uses; the window keydown handler keeps our state in sync.
+  function navigateToHalfMove(target) {
+    const n = analyzedMoves.length;
+    if (!n) return;
+    target = clamp(target, 0, n - 1);
+    const delta = target - currentHalfMove;
+    if (delta === 0) return;
+    const right = delta > 0;
+    const key = right ? 'ArrowRight' : 'ArrowLeft';
+    const code = right ? 39 : 37;
+    for (let k = 0; k < Math.abs(delta); k++) {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key, code: key, keyCode: code, which: code, bubbles: true }));
+    }
+  }
+
   // Destination square + classification of a played move (for the badge).
   function playedMoveBadge(move) {
     if (!move) return null;
@@ -981,6 +1248,7 @@
           </div>
         </div>
         <div class="ca-status" id="ca-status"></div>
+        <div class="ca-graph" id="ca-graph" title="Evaluation over the game — click to jump to a move"></div>
         <div class="ca-view" id="ca-view"></div>
         <div class="ca-log-section">
           <div class="ca-log-header">
@@ -997,7 +1265,7 @@
 
     document.body.appendChild(panel);
 
-    panel.querySelector('.ca-close').addEventListener('click', () => { panel.remove(); clearBoardArrow(); clearEvalBar(); });
+    panel.querySelector('.ca-close').addEventListener('click', () => { abortAnalysis(); panel.remove(); clearBoardArrow(); clearEvalBar(); });
     panel.querySelector('#ca-analyze-btn').addEventListener('click', startAnalysis);
     panel.querySelector('#ca-log-copy').addEventListener('click', async () => {
       const logEl = document.getElementById('ca-log');
@@ -1133,12 +1401,14 @@
           currentHalfMove++;
           currentArrowIdx = -1;
           renderCurrentMove();
+          updateGraphMarker();
         }
       } else if (e.key === 'ArrowLeft') {
         if (currentHalfMove > 0) {
           currentHalfMove--;
           currentArrowIdx = -1;
           renderCurrentMove();
+          updateGraphMarker();
         }
       }
     }, true);
@@ -1203,7 +1473,7 @@
 
   function togglePanel() {
     const existing = document.getElementById('chess-analyzer-panel');
-    if (existing) { existing.remove(); stopShareProbe(); clearBoardArrow(); clearEvalBar(); return; }
+    if (existing) { abortAnalysis(); existing.remove(); stopShareProbe(); clearBoardArrow(); clearEvalBar(); return; }
     injectPanel();
     startShareProbe();
   }
@@ -1211,10 +1481,10 @@
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg?.type === 'TOGGLE_PANEL') togglePanel();
     if (msg?.type === 'ENGINE_RESULT') {
-      const cb = pendingAnalysis.get(msg.id);
-      if (cb) {
+      const entry = pendingAnalysis.get(msg.id);
+      if (entry) {
         pendingAnalysis.delete(msg.id);
-        cb(msg.result);
+        entry.resolve(msg.result);
       }
     }
   });

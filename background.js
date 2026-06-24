@@ -92,4 +92,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return;
   }
+  if (msg?.type === 'STOP_ENGINE') {
+    // Content aborted: tell the offscreen engine to drop its current search and
+    // forget any requests still in flight for this tab (their results, if they
+    // ever arrive, would be stale). Don't spin up an offscreen doc just to stop.
+    const tabId = sender.tab?.id;
+    if (tabId) for (const [id, p] of pending) if (p.tabId === tabId) pending.delete(id);
+    hasOffscreenDocument().then((exists) => {
+      if (exists) chrome.runtime.sendMessage({ type: 'STOP_ENGINE', _to: 'offscreen' }).catch(() => {});
+    });
+    return;
+  }
 });

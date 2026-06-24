@@ -85,6 +85,16 @@ function parseEngineOutput(lines, bestmoveLine) {
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?._to !== 'offscreen') return;
+  if (msg.type === 'STOP_ENGINE') {
+    // Abandon the current search and reset our collector. `stop` makes the
+    // engine emit a final `bestmove`, but with currentId cleared the handler
+    // above ignores it — so the next ANALYZE_POSITION starts from a clean slate.
+    if (worker) { try { worker.postMessage('stop'); } catch { /* noop */ } }
+    currentId = null;
+    collecting = false;
+    buffer = [];
+    return;
+  }
   if (msg.type === 'ANALYZE_POSITION') {
     if (!initialized || !worker) return;
     currentId = msg.id;
